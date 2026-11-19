@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local research data
+/F-F_Research_Data_Factors_daily.csv
+
+# Local backtest results
+/runs/
