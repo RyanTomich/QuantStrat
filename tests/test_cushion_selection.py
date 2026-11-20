@@ -86,4 +86,5 @@ class CushionSelectionTests(unittest.TestCase):
 
     def test_dp_strategy_choices(self):
         self.assertEqual({name for name in STRATEGIES if "dp" in name},
-                         {"stochastic-dp", "cushion-capped-dp-combined"})
+                         {"stochastic-dp", HYBRID, "split-cushion-dp", "chance-constrained-dp",
+                          "discounted-floor-dp"})

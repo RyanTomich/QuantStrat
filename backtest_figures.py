@@ -78,7 +78,8 @@ def write_distribution(folder, results, names, conditions, floor_m, limits, brea
     fig.savefig(folder / "terminal_wealth_distribution.png", dpi=160)
 
 
-def write_figures(folder, results, names, conditions, floor, breach_limit, horizon=12):
+def write_figures(folder, results, names, conditions, floor, breach_limit, horizon=12, reference_paths=None,
+                  *, expanded_grid=False):
     colors = ("#007088", "#a34917", "#952454")
     floor_m = floor / 1_000_000
     wealth = [floor_m, *(r.terminal_wealth / 1_000_000 for r in results)]
@@ -119,3 +120,7 @@ def write_figures(folder, results, names, conditions, floor, breach_limit, horiz
             scatter.text(.5, .5, "No eligible monthly starts", transform=scatter.transAxes, ha="center")
     scatter_axes[-1].set_xlabel("Starting daily equity volatility (prior 63 sessions)")
     diagnostic.savefig(folder / "starting_volatility_vs_wealth.png", dpi=160)
+
+    if reference_paths is not None:
+        from allocation_heatmaps import write_allocation_heatmaps
+        write_allocation_heatmaps(folder, names, reference_paths, floor, expanded_grid=expanded_grid)

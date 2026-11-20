@@ -17,15 +17,27 @@ from pathlib import Path
 from statistics import fmean, harmonic_mean, median, stdev
 from tempfile import mkdtemp
 
-from cushion_selection import HYBRID, MULTIPLIERS, select_multiplier
+from cushion_selection import HYBRID, MULTIPLIERS, SMOOTH_SCALES, TIME_AWARE, select_multiplier, select_smooth_scale
 from trader import (
-    AggressiveTieredCushionTrader,
+    AggressiveTieredCushionTrader, ChanceConstrainedDPTrader, DiscountedFloorDPTrader, SplitDPTrader,
     FLOOR, FixedSplitTrader, FloorAwareGlideTrader, FloorAwareVolatilityTargetTrader,
-    GentleGlideTrader, HighVolatilityReductionTrader, SmoothCushionTrader, Trader,
-    StochasticDPTrader, TradingState, VolatilityScaledCushionTrader, VolatilityTargetTrader,
+    GentleGlideTrader, HighVolatilityReductionTrader, SmoothCushionTrader, TimeAwareSmoothCushionTrader, Trader,
+    StochasticDPTrader, TradingState, VolCappedSmoothCushionTrader, VolatilityScaledCushionTrader, VolatilityTargetTrader,
 )
 
+DP_VARIANTS = {
+    "split-cushion-dp": SplitDPTrader,
+    "chance-constrained-dp": ChanceConstrainedDPTrader,
+    "discounted-floor-dp": DiscountedFloorDPTrader,
+}
+
+VOL_CAPPED = "vol-capped-smooth-cushion"
+FIXED_SMOOTH = "fixed-time-aware-smooth-cushion"
 STRATEGIES = {
+    **DP_VARIANTS,
+    TIME_AWARE: TimeAwareSmoothCushionTrader,
+    FIXED_SMOOTH: TimeAwareSmoothCushionTrader,
+    VOL_CAPPED: VolCappedSmoothCushionTrader,
     HYBRID: partial(StochasticDPTrader, multiplier=MULTIPLIERS[0]),
     "stochastic-dp": StochasticDPTrader,
     "fixed-split": FixedSplitTrader,
@@ -183,10 +195,25 @@ def replay(name: str, trader: Trader, days: list[Session], vol: float, threshold
                         wealth / INITIAL - 1, drawdown, wealth < FLOOR)
 
 
+def launch_trader(name, multiplier, scale, vol_capped_scale_source="incumbent"):
+    if name == HYBRID or name in DP_VARIANTS:
+        return STRATEGIES[name](multiplier=multiplier)
+    if name == TIME_AWARE:
+        return SmoothCushionTrader() if scale is None else TimeAwareSmoothCushionTrader(scale)
+    if name == VOL_CAPPED and vol_capped_scale_source == "incumbent":
+        if scale is None:
+            return VolCappedSmoothCushionTrader(annual_funding_rate=0)
+        return VolCappedSmoothCushionTrader(scale)
+    return STRATEGIES[name]()
+
+
 def run_years(sessions, names, start, end, *, horizon_months=12, selection_history=None,
-              episodes=None):
+              episodes=None, smooth_selection_history=None, reference_paths=None,
+              vol_capped_scale_source="incumbent", smooth_launch_settings=None):
     if type(horizon_months) is not int or horizon_months < 1:
         raise ValueError("horizon_months must be a positive integer")
+    if vol_capped_scale_source not in ("incumbent", "fixed-1"):
+        raise ValueError("vol_capped_scale_source must be incumbent or fixed-1")
     drawdowns = closing_drawdowns(sessions)
     if episodes is not None:
         episodes.extend(crisis_episodes(sessions, drawdowns))
@@ -210,13 +237,20 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
     signals = annual_volatility_signals(vols)
 
     results, excluded = [], {}
-    adaptive = HYBRID in names
+    adaptive = HYBRID in names or any(name in DP_VARIANTS for name in names)
     history = {m: [] for m in MULTIPLIERS}
-    first_year = min(start, sessions[0].date.year) if adaptive else start
+    match_incumbent = VOL_CAPPED in names and vol_capped_scale_source == "incumbent"
+    smooth_adaptive = TIME_AWARE in names or match_incumbent
+    smooth_history = {scale: [] for scale in SMOOTH_SCALES}
+    smooth_year = None
+    first_year = min(start, sessions[0].date.year) if adaptive or smooth_adaptive else start
     first_session = {}
-    if adaptive:
+    if adaptive or smooth_adaptive:
         for session in sessions:
             first_session.setdefault(session.date.year, session.date)
+    latest = None
+    selected = scale = None
+    dp_reason = smooth_mode = ""
     selection_year = None
     for month in range(first_year * 12, (end + 1) * 12):
         year, zero_based_month = divmod(month, 12)
@@ -242,24 +276,69 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
                 selected, audit = select_multiplier(history, first_session[year], VOLATILITY_GROUPS, BREACH_LIMIT)
                 if selection_history is not None:
                     selection_history.extend(dict(strategy=HYBRID, **row) for row in audit)
+                dp_reason = audit[0]["reason"]
                 selection_year = year
             for m in MULTIPLIERS:
                 trader = STRATEGIES[HYBRID](multiplier=m)
                 history[m].append(replay(HYBRID, trader, days, vols[index], threshold, daily_signals))
-        if year < start:
-            continue
         starting_drawdown = drawdowns[offsets[month] - 1]
         if starting_drawdown is None:
             excluded[label] = "insufficient pre-start drawdown history"
             continue
+        if smooth_adaptive:
+            if year >= start and year != smooth_year:
+                scale, audit = select_smooth_scale(smooth_history, first_session[year], CONDITIONS, BREACH_LIMIT)
+                if smooth_selection_history is not None:
+                    smooth_selection_history.extend(audit)
+                smooth_mode = audit[0]["mode"]
+                smooth_year = year
+            for candidate in SMOOTH_SCALES:
+                outcome = replay(TIME_AWARE, TimeAwareSmoothCushionTrader(candidate), days,
+                                 vols[index], threshold, daily_signals)
+                condition = "crisis" if is_crisis(starting_drawdown) else outcome.condition
+                smooth_history[candidate].append(replace(outcome, condition=condition))
+        if year < start:
+            continue
+        if reference_paths is not None:
+            latest = (days, daily_signals, vols[index], threshold, selected, scale, dp_reason, smooth_mode)
         for name in names:
             if name == HYBRID:
                 outcome = history[selected][-1]
+            elif name == TIME_AWARE:
+                if scale is None:
+                    outcome = replay(name, SmoothCushionTrader(), days, vols[index], threshold, daily_signals)
+                else:
+                    outcome = smooth_history[scale][-1]
             else:
-                outcome = replay(name, STRATEGIES[name](), days, vols[index], threshold, daily_signals)
+                trader = launch_trader(name, selected, scale, vol_capped_scale_source)
+                outcome = replay(name, trader, days, vols[index], threshold, daily_signals)
+            if smooth_launch_settings is not None and name in (VOL_CAPPED, TIME_AWARE, FIXED_SMOOTH):
+                matched = name == TIME_AWARE or (name == VOL_CAPPED and match_incumbent)
+                smooth_launch_settings.append(dict(
+                    start_month=label, strategy=name, scale_source="incumbent" if matched else "fixed-1",
+                    mode=smooth_mode if matched else "fixed", risk_scale=scale if matched and scale is not None else 1.,
+                ))
             # Selection history keeps the trader's original two volatility groups.
             results.append(replace(outcome, starting_drawdown=starting_drawdown, horizon_months=horizon_months,
                                    condition="crisis" if is_crisis(starting_drawdown) else outcome.condition))
+    if latest is not None:
+        from allocation_heatmaps import ReferencePath
+
+        days, daily_signals, vol, threshold, selected, scale, dp_reason, smooth_mode = latest
+        for name in names:
+            trader = launch_trader(name, selected, scale, vol_capped_scale_source)
+            settings = ""
+            if name == HYBRID or name in DP_VARIANTS:
+                settings = f"{selected}× multiplier"
+                if dp_reason != "qualified":
+                    settings += f", {dp_reason}"
+            elif name == TIME_AWARE or (name == VOL_CAPPED and match_incumbent):
+                settings = smooth_mode if scale is None else f"{smooth_mode}, scale {scale:g}"
+            elif isinstance(trader, TimeAwareSmoothCushionTrader):
+                settings = f"fixed scale {trader.risk_scale:g}"
+            path = ReferencePath(trader, days[0].date, len(days), daily_signals[0][1], settings)
+            replay(name, path, days, vol, threshold, daily_signals)
+            reference_paths[name] = path
     return results, {month: reason for month, reason in excluded.items() if int(month[:4]) >= start}
 
 
@@ -329,10 +408,63 @@ def summary_row(name, condition, rows, horizon=12):
             f" {fmean(returns):.2%} | {min(returns):.2%} | {max(r.max_drawdown for r in rows):.2%} | " + sensitivity)
 
 
+def smooth_comparison(results, names, selections):
+    mode = {r["selection_date"].year: r["mode"] for r in selections}
+    launches = {r.start_month: r for r in results if r.strategy == TIME_AWARE}
+    counts = {label: sum(mode[r.year] == label for r in launches.values())
+              for label in ("nominal warm-up", "calibrated", "cash fallback")}
+    lines = ["", "## Time-aware smooth cushion", "",
+             ", ".join(f"{label}: {count} launches" for label, count in counts.items()), "",
+             "Matched starts, ordered by group feasibility and then arithmetic mean terminal wealth. "
+             "Every launch group must have an observed breach rate strictly below 2%. "
+             "Dollar figures are in millions.", "",
+             "| Strategy | Meets group limit | Mean | Paired mean gain over time-aware | CE | Worst |",
+             "|---|---|---:|---:|---:|---:|"]
+    ranking = []
+    for name in names:
+        group = [r for r in results if r.strategy == name]
+        if {r.start_month for r in group} != launches.keys():
+            raise ValueError("Smooth comparisons require identical monthly starts")
+        feasible = all(sum(r.floor_breach for r in group if r.condition == c)
+                       < BREACH_LIMIT * sum(r.condition == c for r in group) for c in CONDITIONS)
+        values = [r.terminal_wealth / 1e6 for r in group]
+        gain = fmean((r.terminal_wealth - launches[r.start_month].terminal_wealth) / 1e6 for r in group)
+        mean = fmean(values)
+        ranking.append((feasible, mean, f"| {name} | {'yes' if feasible else 'no'} | {mean:.3f} | "
+                        f"{gain:+.3f} | {harmonic_mean(values):.3f} | {min(values):.3f} |"))
+    return lines + [row for _, _, row in sorted(ranking, reverse=True)]
+
+
+def vol_capped_comparison(results, names):
+    """Compare terminal dollars and CE on exactly the same launches in each group."""
+    outcomes = {name: {row.start_month: row for row in results if row.strategy == name} for name in names}
+    capped = outcomes[VOL_CAPPED]
+    lines = ["", "## Volatility-capped smooth cushion", "",
+             "Dollar figures are millions. Paired differences are capped minus the named strategy. "
+             "Compare CE among strategies with at most 2% breaches in each launch group.", "",
+             "| Strategy | Launch condition | Starts | Mean wealth | Worst wealth | CE | Paired Δ mean | Paired Δ CE |",
+             "|---|---|---:|---:|---:|---:|---:|---:|"]
+    for name, group in outcomes.items():
+        if group.keys() != capped.keys() or any(row.condition != capped[m].condition for m, row in group.items()):
+            raise ValueError("Volatility-capped comparisons require identical starts and launch conditions")
+        for condition in ("all", *CONDITIONS):
+            months = [m for m, row in group.items() if condition == "all" or row.condition == condition]
+            if not months:
+                continue
+            values = [group[m].terminal_wealth / 1e6 for m in months]
+            paired = [capped[m].terminal_wealth / 1e6 for m in months]
+            ce = harmonic_mean(values)
+            gain = fmean(a - b for a, b in zip(paired, values))
+            lines.append(f"| {name} | {condition} | {len(months)} | {fmean(values):.3f} | {min(values):.3f} | "
+                         f"{ce:.3f} | {gain:+.3f} | {harmonic_mean(paired)-ce:+.3f} |")
+    return lines
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategy", action="append", choices=STRATEGIES)
     parser.add_argument("--horizon-months", type=int, default=12)
+    parser.add_argument("--vol-capped-scale-source", choices=("incumbent", "fixed-1"), default="incumbent")
     parser.add_argument("--start-year", type=int)
     parser.add_argument("--end-year", type=int)
     parser.add_argument("--data", type=Path, default=Path("F-F_Research_Data_Factors_daily.csv"))
@@ -345,11 +477,16 @@ def main(argv=None):
         end = args.end_year if args.end_year is not None else sessions[-1].date.year
         if not 1 <= start <= end <= 9999:
             raise ValueError("Expected 1 <= start-year <= end-year <= 9999")
+        reference_paths = {}
+        smooth_selections = []
+        launch_settings = []
         selections = []
         episodes = []
         horizon = args.horizon_months
         results, excluded = run_years(sessions, names, start, end, horizon_months=horizon, episodes=episodes,
-                                      selection_history=selections)
+                                      selection_history=selections, smooth_selection_history=smooth_selections,
+                                      reference_paths=reference_paths, vol_capped_scale_source=args.vol_capped_scale_source,
+                                      smooth_launch_settings=launch_settings if VOL_CAPPED in names else None)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
@@ -372,6 +509,8 @@ def main(argv=None):
         for condition in CONDITIONS:
             table.append(summary_row(name, condition, [r for r in rows if r.condition == condition], horizon))
     lines.extend(table)
+    if VOL_CAPPED in names:
+        lines.extend(vol_capped_comparison(results, names))
     lines.extend(["", f"Each monthly start begins with $100M and runs for {horizon} calendar months. CE is the harmonic mean of terminal wealth. "
                   "Each monthly launch counts once. Schedule sensitivity spans nonempty calendar offsets with disjoint "
                   "holding periods within each offset. This range measures timing sensitivity, not statistical confidence."])
@@ -389,9 +528,27 @@ def main(argv=None):
             writer.writeheader()
             writer.writerows(selections)
         from cushion_report import comparison_report
-        lines.extend(comparison_report(folder, results, names, FLOOR))
-    write_figures(folder, results, names, CONDITIONS, FLOOR, BREACH_LIMIT, horizon)
+        if HYBRID in names and results:
+            lines.extend(comparison_report(folder, results, names, FLOOR))
+    if smooth_selections:
+        with (folder / "smooth_selection_history.csv").open("w", newline="", encoding="utf-8") as out:
+            writer = csv.DictWriter(out, fieldnames=smooth_selections[0])
+            writer.writeheader()
+            writer.writerows(smooth_selections)
+        if TIME_AWARE in names:
+            lines.extend(smooth_comparison(results, names, smooth_selections))
+    if launch_settings:
+        with (folder / "smooth_launch_settings.csv").open("w", newline="", encoding="utf-8") as out:
+            writer = csv.DictWriter(out, fieldnames=launch_settings[0])
+            writer.writeheader()
+            writer.writerows(launch_settings)
+    write_figures(folder, results, names, CONDITIONS, FLOOR, BREACH_LIMIT, horizon, reference_paths,
+                  expanded_grid=VOL_CAPPED in names)
+    if not reference_paths:
+        lines.extend(["", "Allocation heatmaps have no reference launch because no monthly start was eligible."])
     lines.extend(["", "![Terminal wealth distribution](terminal_wealth_distribution.png)",
+                  "", "![Stock allocation by volatility](stock_allocation_by_volatility.png)",
+                  "", "![Stock allocation by time remaining](stock_allocation_by_time.png)",
                   "", "![Starting volatility and terminal wealth](starting_volatility_vs_wealth.png)"])
     (folder / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(table), end="\n\n")

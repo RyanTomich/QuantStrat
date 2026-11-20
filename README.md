@@ -66,12 +66,16 @@ python3 backtest.py --strategy tiered-cushion-3x --strategy vol-scaled-cushion -
 
 `smooth-cushion-4x` uses 1.25 times the volatility-scaled base multiplier. For each additional dollar of cushion, its factor is 1 through $3M, rises linearly to 3 at $7M, holds at 3 through $15M, rises linearly to 4 at $25M, and holds at 4 thereafter. Total equity is the sum across the occupied bands, capped at available wealth.
 
-Each invocation prints the full metrics table for every strategy, overall and by launch state, then the path to its run folder. The table includes certainty-equivalent wealth, terminal floor breaches (count and rate), mean and worst cumulative horizon return, and the largest within-horizon drawdown. Each folder contains four files.
+Each invocation prints the full metrics table for every strategy, overall and by launch state, then the path to its run folder. The table includes certainty-equivalent wealth, terminal floor breaches (count and rate), mean and worst cumulative horizon return, and the largest within-horizon drawdown. Each run produces these standard files.
 
 - `annual_results.csv` records the strategy, start year and month, first and last session, session count, starting daily volatility, historical median daily volatility, launch drawdown, horizon in months, condition, terminal dollar wealth, total return, maximum drawdown, and terminal floor-breach flag. Returns and volatilities are decimals. Drawdown is a positive loss fraction measured from the running peak, including starting wealth.
 - `summary.md` records the command, data checksum, eligible start count, date range, excluded months, and results overall and by starting condition. Each monthly start has equal weight. Compare strategies on certainty-equivalent terminal wealth (the harmonic mean for γ = 2) alongside the observed frequency of terminal wealth below $95M in each condition.
 - `terminal_wealth_distribution.png` shows one cumulative distribution per strategy across all eligible monthly starts. Each dot on the $95M floor marker shows the share of starts that finished strictly below the floor. The lower panel shows each strategy’s observed breach rate for each starting condition against the dashed 2% line. The 2% comparison uses observed frequencies.
+- `stock_allocation_by_volatility.png` shows the post-trade stock percentage against current wealth ($92M to $112M in $100K steps) and annualized forecast volatility (5% to 40% in one-point steps). Each strategy is shown at 252 sessions remaining, or the full launch horizon if shorter.
+- `stock_allocation_by_time.png` uses the same wealth grid and 0–100% stock color scale. Each strategy has columns at 15% and 30% annualized volatility. Rows show 1, 5, 21, 63, 126, 252 and 504 sessions remaining when available, plus the full horizon.
 - `starting_volatility_vs_wealth.png` plots each monthly start against its pre-start daily volatility, with the three lowest terminal wealth outcomes labeled by start month. The scatter plot uses a separate panel for each strategy and common axes for comparison. The shaded area below $95M marks terminal breaches. A finish on the line meets the floor.
+
+The allocation heatmaps use the latest eligible launch. Captions identify its date, session count, launch volatility cutoff and adaptive settings. Each cell scales the reference portfolio’s opening stock and cash on that session to the plotted wealth, then quotes the actual trading rule using the plotted volatility and the launch cutoff. The split trader retains its sleeve ownership and the chance-constrained trader retains its launch-day policy. A blank cell indicates a reference portfolio with zero wealth, for which the stock/cash proportions are undefined. A run without eligible launches produces labeled empty heatmaps.
 
 The main table counts each eligible launch once. For schedule sensitivity, it assigns calendar months to offsets using `(12 × year + month − 1) modulo horizon_months`. Holding periods within each offset are disjoint. Within each state the table shows the lowest and highest nonempty offset rates, their breach counts and denominators, and how many offsets contributed. Ties use the lowest offset. The range describes sensitivity to launch timing.
 
@@ -102,3 +106,73 @@ python3 backtest.py --strategy stochastic-dp --strategy cushion-capped-dp-combin
 ```
 
 The run folder includes `selection_history.csv` with one row per candidate and selection year. The report compares terminal wealth, losses near the floor, and results by starting decade and launch state. Paired 12-month block bootstrap intervals summarize historical uncertainty for differences in CE and mean wealth. The selection audit reports the two volatility groups used by the policy.
+
+### Three independent variants of the combined DP
+
+Each variant inherits the combined strategy's opening-year multiplier from the same completed-history selection, including when run alone. Each gets a fresh trader per monthly launch. All three use the same daily equity/cash trading contract and nominal $95M terminal breach event.
+
+- `split-cushion-dp` initially gives half the capital to the combined DP and half to the uncapped stochastic DP. It tracks ownership of each asset separately and scales sleeve orders from virtual $100M accounts. The sleeves retain gains and losses independently.
+- `chance-constrained-dp` keeps the combined cap and action set and maximizes modeled mean terminal dollars among four candidate policies and cash. The candidates use terminal breach penalties of $0, $10M, $100M and $1B. The ordinary regime adds a −10% excess-return gap with daily probability 0.1%. The high-volatility regime adds a −20% gap with probability 0.4%. The other two shocks retain their original spacing and shift together to preserve the original expected equity premium. These fixed scenario assumptions are illustrative. Backward induction tracks terminal mean and breach probability for each policy. On the launch grid point, the trader selects the highest-mean candidate with modeled breach probability strictly below 2% and keeps that policy through maturity. Cash is feasible from the mandated $100M start. The model conditions on the daily volatility regime. The historical report evaluates all three launch conditions, including crisis.
+- `discounted-floor-dp` uses a funding floor of `95M / (1 + 0.02/252) ** remaining_sessions` in both backward induction and order sizing. It inherits the incumbent's fixed cash-rate assumption and tiered cap. The historical account earns the realized cash return.
+
+Run this comparison for each horizon. The reports and figures are written to the run directories printed by the backtest.
+
+```sh
+for months in 12 24; do
+  python3 backtest.py --strategy cushion-capped-dp-combined --strategy split-cushion-dp \
+    --strategy chance-constrained-dp --strategy discounted-floor-dp \
+    --start-year 1950 --end-year 2025 --horizon-months "$months"
+done
+# Set RUN_12_MONTHS and RUN_24_MONTHS to the printed run directories.
+python3 plot_dp_benchmark.py "$RUN_12_MONTHS" "$RUN_24_MONTHS" --output runs/dp_benchmark.png
+```
+
+### Time-aware Smooth Cushion
+
+Use `--strategy time-aware-smooth-cushion` for the walk-forward trader and
+`--strategy fixed-time-aware-smooth-cushion` for its scale-1 benchmark.
+Both use the smooth cushion curve with a daily funding floor of
+`95M / (1 + 0.02/252) ** remaining_sessions`. The 2% modeled rate sizes the
+position. Cash in the backtest earns the observed daily RF return. The terminal
+breach test uses the nominal $95M floor.
+
+Each January, the walk-forward trader compares risk scales 0, 0.5, 0.75, 1,
+1.25 and 1.5 on matched launches of the same horizon completed before the
+first session of that year. It maximizes arithmetic mean terminal wealth among
+scales with at least 50 observations and strictly below 2% terminal breaches in
+each of the lower-volatility, higher-volatility and crisis launch groups.
+Ties favor the smaller scale. Each launch keeps its opening rule to maturity.
+Insufficient coverage uses nominal-floor Smooth Cushion. With sufficient
+coverage and no qualifying scale, the launch holds cash.
+
+The run writes each candidate and decision to `smooth_selection_history.csv`.
+The summary reports launch counts by selection mode and compares mean wealth,
+paired gains, certainty-equivalent wealth, worst terminal wealth and group feasibility.
+
+```sh
+python3 backtest.py --strategy time-aware-smooth-cushion --strategy fixed-time-aware-smooth-cushion --strategy smooth-cushion-4x --start-year 1950 --end-year 2025 --horizon-months 12
+```
+
+### Volatility-capped smooth cushion
+
+`vol-capped-smooth-cushion` keeps the time-aware funding floor and the incumbent's marginal cushion bands. Let `E` be the unscaled dollar exposure from those bands, `W` current wealth, `s` the opening risk scale, and `v` forecast annualized volatility as a decimal. Its equity weight is
+
+```text
+m = 3 / (1 + (v / 0.10)^6)^(1/6)
+L = 1 / (1 + (v / 0.30)^4)
+r = 1.25 * s * m * E / W
+w = r / (1 + (r / L)^4)^(1/4)
+```
+
+Calculate `r` before clipping. At 30% volatility the stock weight approaches a 50% ceiling as wealth increases. At 40% volatility the ceiling is about 24%. A nonpositive cushion or zero risk scale leaves the account in cash. At maturity the order is zero.
+
+The default `--vol-capped-scale-source incumbent` uses the existing adaptive smooth trader's annual scale, selected from that trader's completed same-horizon launches. The capped trader uses its own equations during nominal-floor warm-up with scale 1. The incumbent's cash fallback gives both traders scale 0. With `--vol-capped-scale-source fixed-1`, the capped trader uses scale 1 and the discounted floor throughout.
+
+Reproduce the two contender comparisons from the repository root:
+
+```sh
+python3 backtest.py --strategy vol-capped-smooth-cushion --strategy time-aware-smooth-cushion --strategy chance-constrained-dp --vol-capped-scale-source incumbent --horizon-months 12 --start-year 1950 --end-year 2025
+python3 backtest.py --strategy vol-capped-smooth-cushion --strategy fixed-time-aware-smooth-cushion --strategy chance-constrained-dp --vol-capped-scale-source fixed-1 --horizon-months 24 --start-year 1950 --end-year 2025
+```
+
+Each run prints its folder. The summary includes mean, worst and certainty-equivalent terminal wealth overall and by launch condition, with matched differences in mean and CE measured as capped minus comparator. The main table records floor events, cumulative returns and maximum drawdown. `smooth_launch_settings.csv` records the opening mode, scale source and effective scale for each smooth trader and start. The terminal-wealth CDF shows the floor detail and conditional breach rates. For runs including the capped trader, both allocation heatmaps extend to $130M and the volatility heatmap samples 5% through 40% in 0.25-percentage-point steps.
