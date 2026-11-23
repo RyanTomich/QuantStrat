@@ -1,7 +1,7 @@
 import unittest
 from datetime import date, timedelta
 
-from backtest import Session, replay
+from plot_backtest import Session, replay
 from stochastic_dp import ChancePolicy, WealthPolicy, cap_weight
 from trader import (FLOOR, ChanceConstrainedDPTrader, DiscountedFloorDPTrader,
                     SplitDPTrader, StochasticDPTrader, TradingState)

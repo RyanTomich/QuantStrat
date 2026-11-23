@@ -1,3 +1,4 @@
+import csv
 import io
 import os
 import tempfile
@@ -9,8 +10,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from allocation_heatmaps import ReferencePath, TIME_VOLATILITY, VOLATILITY, WEALTH
-from backtest import INITIAL, Session, main, replay
+from plot_allocation_heatmaps import ReferencePath, TIME_VOLATILITY, VOLATILITY, WEALTH
+from plot_backtest import INITIAL, Session, main, replay
 from trader import (ChanceConstrainedDPTrader, FixedSplitTrader, SplitDPTrader,
                     StochasticDPTrader, TradingState)
 
@@ -73,9 +74,16 @@ class AllocationHeatmapTests(unittest.TestCase):
                     main(["--data", str(data), "--start-year", year, "--end-year", year,
                           "--horizon-months", "1", *options])
                 folder = Path(stdout.getvalue().splitlines()[-1])
-                summary = (folder / "summary.md").read_text()
+                self.assertEqual(stdout.getvalue().splitlines(), [str(folder)])
+                self.assertFalse((folder / "summary.md").exists())
+                with (folder / "summary.csv").open() as stream:
+                    summary = list(csv.DictReader(stream))
+                overall = {row["strategy"]: row for row in summary if row["condition"] == "all"}
+                self.assertEqual(set(overall), set(names))
+                # The close before January 2020 lacks a full year of drawdown history.
+                self.assertEqual(int(overall["fixed-split"]["starts"]), 11 if year == "2020" else 0)
+                self.assertEqual(overall["fixed-split"]["ce_wealth"] == "", year == "2018")
                 for name in ("terminal_wealth_distribution", "stock_allocation_by_time",
-                             "stock_allocation_by_volatility", "starting_volatility_vs_wealth"):
-                    self.assertIn(f"({name}.png)", summary)
+                             "stock_allocation_by_volatility"):
                     self.assertGreater((folder / f"{name}.png").stat().st_size, 1000)
-                self.assertEqual("no reference launch" in summary, year == "2018")
+                self.assertFalse((folder / "starting_volatility_vs_wealth.png").exists())

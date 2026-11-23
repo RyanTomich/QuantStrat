@@ -1,11 +1,10 @@
-"""Regenerate the DP progression and smooth-cushion comparison from the archived monthly launch sample."""
+"""Replay the report's monthly launches from daily market data and generate its tables and figures."""
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 from functools import cache
-from statistics import harmonic_mean, stdev
+from statistics import harmonic_mean
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib import rcParams
@@ -14,75 +13,39 @@ from matplotlib.ticker import PercentFormatter
 OUT = Path(__file__).resolve().parent
 ROOT = OUT.parents[1]
 sys.path.insert(0, str(ROOT))
-from allocation_heatmaps import ReferencePath, VOLATILITY
-import backtest as bt
+from plot_allocation_heatmaps import ReferencePath, VOLATILITY
+import plot_backtest as bt
 from stochastic_dp import ChancePolicy, WealthPolicy
 from trader import StochasticDPTrader, FLOOR
 
-run = ROOT / Path("runs/20261120T175115Z-84zev02c")
-comparison_runs = {
-    12: ROOT / "runs/20261120T184542Z-lhqkdp2f",
-    24: ROOT / "runs/20261120T184548Z-uzs9td6_",
+progression_labels = ["DP", "+ equity cap", "+ downside shocks", "+ policy selection"]
+comparison_labels = ["Full DP", "Volatility-capped smooth cushion"]
+
+families = {
+    "Fixed allocation": {"Fixed 60/40": "fixed-split"},
+    "Glide path": {
+        "65–35 glide": "glide-65-35",
+        "Floor-aware glide": "floor-aware-glide",
+    },
+    "Volatility targeting": {
+        "Volatility target": "vol-target",
+        "Floor-aware vol target": "floor-aware-vol-target",
+        "High-vol reduction": "high-vol-reduction",
+    },
+    "Cushion": {
+        "Vol-scaled cushion": "vol-scaled-cushion",
+        "Tiered cushion": "tiered-cushion-3x",
+        "Smooth 4× cushion": "smooth-cushion-4x",
+        "Fixed time-aware cushion": bt.FIXED_SMOOTH,
+        "Time-aware smooth cushion": bt.TIME_AWARE,
+        comparison_labels[1]: bt.VOL_CAPPED,
+    },
 }
-
-
-def read(name, folder=run):
-    with (folder / name).open() as f:
-        return list(csv.DictReader(f))
-
-
-def write_comparison_table():
-    lines = [
-        r"\begin{tabular}{@{}llrrrrr@{}}",
-        r"\hline",
-        r"& & & \multicolumn{2}{c}{Chance-constrained DP} & \multicolumn{2}{c}{Smooth cushion} \\",
-        r"\cline{4-5}\cline{6-7}",
-        r"Horizon & Launch condition & Launches & CE (\$M) & Breaches (\%) & CE (\$M) & Breaches (\%) \\",
-        r"\hline",
-    ]
-    for months, folder in comparison_runs.items():
-        results = read("annual_results.csv", folder)
-        samples = []
-        for strategy in ("chance-constrained-dp", bt.VOL_CAPPED):
-            sample = {}
-            for row in results:
-                if row["strategy"] != strategy:
-                    continue
-                key = (row["first_session"], row["last_session"], row["condition"])
-                if key in sample or int(row["horizon_months"]) != months:
-                    raise ValueError(f"Unexpected launch for {strategy} in {folder}: {key}")
-                sample[key] = float(row["terminal_wealth"])
-            samples.append(sample)
-        if samples[0].keys() != samples[1].keys():
-            raise ValueError(f"Strategies have different launches in {folder}")
-
-        if months != next(iter(comparison_runs)):
-            lines.append(r"\hline")
-        for condition in ("all", *bt.CONDITIONS):
-            keys = [key for key in samples[0] if condition == "all" or key[2] == condition]
-            label = "All launches" if condition == "all" else condition.replace("-", " ").capitalize()
-            cells = [f"{months} months" if condition == "all" else "", label, str(len(keys))]
-            for sample in samples:
-                wealth = [sample[key] for key in keys]
-                breaches = sum(w < FLOOR for w in wealth)
-                rate = f"{100 * breaches / len(wealth):.2f}" if breaches else "0"
-                cells.extend([f"{harmonic_mean(wealth) / 1e6:.2f}", rf"{breaches} ({rate}\%)"])
-            lines.append(" & ".join(cells) + r" \\")
-    lines.extend([r"\hline", r"\end{tabular}"])
-    (OUT / "strategy-comparison.tex").write_text("\n".join(lines) + "\n")
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--table-only", action="store_true", help="Generate both report tables and skip plotting.")
+parser.add_argument("--table-only", action="store_true", help="Generate the report tables and skip plotting.")
 args = parser.parse_args()
-write_comparison_table()
-
-rows = read("annual_results.csv")
-mult = {
-    r["selection_date"][:4]: int(r["selected_multiplier"])
-    for r in read("selection_history.csv")
-}
-
 
 class GapUtility(WealthPolicy):
     """Use the three-shock transition law with the original terminal utility."""
@@ -120,78 +83,89 @@ class GapTrader(StochasticDPTrader):
 
 
 sessions = bt.read_sessions((ROOT / "F-F_Research_Data_Factors_daily.csv").read_bytes())
-offset = {s.date.isoformat(): i for i, s in enumerate(sessions)}
-ret = [s.equity_return for s in sessions]
-signals = bt.annual_volatility_signals(
-    [stdev(ret[i : i + 63]) for i in range(len(ret) - 63)]
+names = ["stochastic-dp", bt.HYBRID, "chance-constrained-dp"]
+for candidates in families.values():
+    names.extend(candidates.values())
+selection_history = []
+smooth_settings = []
+results, _ = bt.run_years(
+    sessions, names, 1950, 2025, horizon_months=12, selection_history=selection_history,
+    vol_capped_scale_source="incumbent", smooth_launch_settings=smooth_settings,
 )
-base = [r for r in rows if r["strategy"] == "stochastic-dp"]
+mult = {r["selection_date"].year: r["selected_multiplier"] for r in selection_history}
+offset = {s.date: i for i, s in enumerate(sessions)}
+ret = [s.equity_return for s in sessions]
+signals = bt.annual_volatility_signals(bt.rolling_daily_volatilities(ret, bt.DEFAULT_VOL_LOOKBACK))
+by_month = {name: {} for name in names}
+for row in results:
+    group = by_month[row.strategy]
+    if row.start_month in group:
+        raise ValueError(f"Duplicate {row.strategy} launch for {row.start_month}")
+    group[row.start_month] = row
+baseline = by_month["stochastic-dp"]
+base = [baseline[month] for month in sorted(baseline)]
+if not base:
+    raise ValueError("No eligible monthly launches for the report")
 
 
-def archived(name, source=rows):
-    group = [r for r in source if r["strategy"] == name]
-    assert [
-        (r["first_session"], r["last_session"], r["starting_volatility"]) for r in group
-    ] == [
-        (r["first_session"], r["last_session"], r["starting_volatility"]) for r in base
-    ]
-    return np.array([float(r["terminal_wealth"]) for r in group]) / 1e6
+def launch_conditions(row):
+    return (row.first_session, row.last_session, row.starting_volatility,
+            row.median_volatility, row.condition)
+
+
+def matched_wealth(name):
+    group = by_month[name]
+    if group.keys() != baseline.keys():
+        raise ValueError(f"{name} covers different launch months than baseline DP")
+    wealth = []
+    for launch in base:
+        row = group[launch.start_month]
+        if launch_conditions(row) != launch_conditions(launch):
+            raise ValueError(f"{name} has different launch inputs for {launch.start_month}")
+        wealth.append(row.terminal_wealth)
+    return np.array(wealth) / 1e6
 
 
 def launch_inputs(r):
-    a, b = offset[r["first_session"]], offset[r["last_session"]] + 1
+    a, b = offset[r.first_session], offset[r.last_session] + 1
     return (
         sessions[a:b],
-        float(r["starting_volatility"]),
-        float(r["median_volatility"]),
-        signals[a - 63 : b - 63],
+        r.starting_volatility,
+        r.median_volatility,
+        signals[a - bt.DEFAULT_VOL_LOOKBACK : b - bt.DEFAULT_VOL_LOOKBACK],
     )
 
 
-gap = []
-for r in base:
-    inputs = launch_inputs(r)
-    if len(gap) % 100 == 0:
-        assert (
-            abs(
-                bt.replay("base", StochasticDPTrader(), *inputs).terminal_wealth
-                - float(r["terminal_wealth"])
-            )
-            < 0.01
-        )
-    gap.append(
-        bt.replay("gap", GapTrader(mult[r["year"]]), *inputs).terminal_wealth / 1e6
-    )
+wealth_by_strategy = {name: matched_wealth(name) for name in names}
+gap = [
+    bt.replay("gap", GapTrader(mult[r.year]), *launch_inputs(r)).terminal_wealth
+    for r in base
+]
 series = [
-    archived("stochastic-dp"),
-    archived(bt.HYBRID),
-    np.array(gap),
-    archived("chance-constrained-dp"),
+    wealth_by_strategy["stochastic-dp"],
+    wealth_by_strategy[bt.HYBRID],
+    np.array(gap) / 1e6,
+    wealth_by_strategy["chance-constrained-dp"],
 ]
 
-smooth_run = comparison_runs[12]
-comparison = read("annual_results.csv", smooth_run)
-dp = archived("chance-constrained-dp", comparison)
-np.testing.assert_array_equal(dp, series[-1])
-smooth = archived(bt.VOL_CAPPED, comparison)
-
-overview = {
-    "Standard DP": series[0],
-    "DP with equity cap": series[1],
-    "Capped DP with downside shocks": series[2],
-    "Chance-constrained DP": dp,
-    "Smooth cushion": smooth,
-}
-conditions = np.array([r["condition"] for r in base])
+overview = dict(zip(progression_labels, series, strict=True))
+overview[comparison_labels[1]] = wealth_by_strategy[bt.VOL_CAPPED]
+conditions = np.array([r.condition for r in base])
 floor_millions = FLOOR / 1e6
-eligible = {
-    name for name, wealth in overview.items()
-    if all(np.mean(wealth[conditions == c] < floor_millions) <= bt.BREACH_LIMIT
-           for c in bt.CONDITIONS)
-}
+
+def meets_breach_limit(wealth):
+    return all(np.mean(wealth[conditions == c] < floor_millions) <= bt.BREACH_LIMIT
+               for c in bt.CONDITIONS)
+
+
+eligible = {name for name, wealth in overview.items() if meets_breach_limit(wealth)}
 lines = [
     r"\begin{tabular}{@{}lrrr@{}}", r"\hline",
-    r"Strategy & Objective: CE (\$M) & Mean $W_T$ (\$M) & Breaches (\%) \\", r"\hline",
+    r"Strategy & CE (\$M) & Mean $W_T$ (\$M) & Breaches (\%) \\", r"\hline",
+]
+slide_lines = [
+    r"\begin{tabular}{@{}lrr@{}}", r"\hline",
+    r"Strategy & CE (\$M) & Breach rate \\", r"\hline",
 ]
 for condition in ("all", *bt.CONDITIONS):
     mask = np.ones(len(base), dtype=bool) if condition == "all" else conditions == condition
@@ -201,6 +175,20 @@ for condition in ("all", *bt.CONDITIONS):
     for name, wealth in overview.items():
         sample = wealth[mask]
         metrics[name] = (harmonic_mean(sample), sample.mean(), np.count_nonzero(sample < floor_millions))
+    slide_rows = {
+        "Regular DP": metrics[progression_labels[0]],
+        "Full DP": metrics[progression_labels[-1]],
+        "Vol.-capped cushion": metrics[comparison_labels[1]],
+    }
+    slide_lines.append(rf"\multicolumn{{3}}{{@{{}}l}}{{\itshape {label} ($n={mask.sum()}$)}} \\")
+    highest_ce = max(ce for ce, _, _ in slide_rows.values())
+    fewest_breaches = min(count for _, _, count in slide_rows.values())
+    for name, (ce, _, count) in slide_rows.items():
+        ce_cell = rf"\textbf{{{ce:.2f}}}" if ce == highest_ce else f"{ce:.2f}"
+        rate = rf"{100 * count / mask.sum():.2f}\%"
+        rate_cell = rf"\textbf{{{rate}}}" if count == fewest_breaches else rate
+        slide_lines.append(rf"{name} & {ce_cell} & {rate_cell} \\")
+    slide_lines.append(r"\hline")
     best_ce = max((metrics[name][0] for name in eligible), default=None)
     best_mean = max(mean for _, mean, _ in metrics.values())
     fewest = min(count for _, _, count in metrics.values())
@@ -213,22 +201,50 @@ for condition in ("all", *bt.CONDITIONS):
         lines.append(r"\hline")
 lines.extend([r"\hline", r"\end{tabular}"])
 (OUT / "strategy-overview.tex").write_text("\n".join(lines) + "\n")
+slide_lines.append(r"\end{tabular}")
+(OUT / "slide-performance.tex").write_text("\n".join(slide_lines) + "\n")
+
+alternatives = {"Full DP": wealth_by_strategy["chance-constrained-dp"]}
+for family, strategies in families.items():
+    candidates = {label: wealth_by_strategy[name] for label, name in strategies.items()}
+    qualifying = [name for name, wealth in candidates.items() if meets_breach_limit(wealth)]
+    if qualifying:
+        name = max(qualifying, key=lambda name: harmonic_mean(candidates[name]))
+    elif family == "Fixed allocation" and len(candidates) == 1:
+        # Retain the sole fixed-weight rule as an explicitly ineligible benchmark.
+        name, = candidates
+    else:
+        raise ValueError(f"No eligible candidate in {family}")
+    alternatives[name] = candidates[name]
+
+lines = [
+    r"\begin{tabular}{@{}lrrr@{}}", r"\hline",
+    r"Strategy & CE (\$M) & Mean $W_T$ (\$M) & Breach rate (\%) \\", r"\hline",
+]
+alternative_metrics = {
+    name: (harmonic_mean(wealth), wealth.mean(), 100 * np.mean(wealth < floor_millions))
+    for name, wealth in alternatives.items()
+}
+ce_values, means, breach_rates = zip(*alternative_metrics.values())
+best_values = (max(ce_values), max(means), min(breach_rates))
+for name, values in alternative_metrics.items():
+    cells = [
+        rf"\textbf{{{value:.2f}}}" if value == best else f"{value:.2f}"
+        for value, best in zip(values, best_values, strict=True)
+    ]
+    lines.append(" & ".join([name, *cells]) + r" \\")
+lines.extend([r"\hline", r"\end{tabular}"])
+(OUT / "alternatives-overview.tex").write_text("\n".join(lines) + "\n")
 if args.table_only:
     sys.exit(0)
 
-labels = [
-    "Standard DP",
-    "+ Equity cap",
-    "+ Downside shock",
-    "+ Terminal chance constraint",
-]
-colors = ["#435465", "#007a72", "#b55c16", "#623f8d"]
-styles = ["-", "--", ":", "-."]
+colors = ["#435465", "#007a72", "#b55c16", "#623f8d", "#b32658"]
+styles = ["-", "--", ":", "-.", "-"]
 rcParams.update({"font.size": 9, "pdf.fonttype": 42})
 
-launch = max(base, key=lambda row: row["first_session"])
+launch = base[-1]
 days, daily_vol, median_vol, forecasts = launch_inputs(launch)
-multiple = mult[launch["year"]]
+multiple = mult[launch.year]
 cutoff = forecasts[0][1]
 remaining = min(len(days), 252)
 traders = [
@@ -238,10 +254,10 @@ traders = [
     bt.ChanceConstrainedDPTrader(multiple),
 ]
 
-def plot_allocations(traders, labels, settings, filename):
-    rows = len(traders) // 2
-    fig = Figure(figsize=(7.2, 2.0 * rows + 0.9), layout="constrained")
-    axes = fig.subplots(rows, 2, sharex=True, sharey=True)
+def plot_allocations(traders, labels, settings, filename, *, columns=2):
+    rows = len(traders) // columns
+    fig = Figure(figsize=(3.6 * columns, 2.0 * rows + 0.9), layout="constrained")
+    axes = fig.subplots(rows, columns, sharex=True, sharey=True, squeeze=False)
     wealth_grid = np.arange(92_000_000, 130_000_001, 100_000)
     for index, (ax, trader, label) in enumerate(zip(axes.flat, traders, labels)):
         path = ReferencePath(trader, days[0].date, len(days), cutoff)
@@ -277,17 +293,15 @@ def plot_allocations(traders, labels, settings, filename):
     fig.savefig(OUT / filename)
 
 
-# Use the four-stage plot's endpoints for both CDFs, including its default margins.
-left = min(map(min, series)) - 1
-right = max(map(max, series)) + 1
-
-
-def plot_cdf(series, labels, colors, styles, filename, *, inset_max=96):
+def plot_cdf(curves, colors, styles, filename):
+    # Preserve the original main panel's endpoints and default margins.
+    left = min(map(min, series)) - 1
+    right = max(map(max, series)) + 1
     fig = Figure(figsize=(7.1, 4.5), layout="constrained")
     ax = fig.subplots()
     inset = ax.inset_axes([0.58, 0.14, 0.385, 0.36])
-    for y, label, color, style in zip(series, labels, colors, styles):
-        x = np.r_[left, np.sort(y), right]
+    for (label, y), color, style in zip(curves.items(), colors, styles, strict=True):
+        x = np.r_[min(left, min(y)), np.sort(y), max(right, max(y))]
         prob = np.r_[0, np.arange(1, len(y) + 1) / len(y), 1]
         for panel in (ax, inset):
             panel.step(x, prob, where="post", color=color, label=label, ls=style, lw=1.6)
@@ -297,32 +311,44 @@ def plot_cdf(series, labels, colors, styles, filename, *, inset_max=96):
         panel.axvline(95, color="#666666", ls=":", lw=0.9)
         panel.grid(axis="y", alpha=0.16)
         panel.yaxis.set_major_formatter(PercentFormatter(1, decimals=0))
+    margin = (right - left) * rcParams["axes.xmargin"]
     ax.set(
+        xlim=(left - margin, right + margin),
         xlabel="12-month terminal wealth ($ millions)",
         ylabel="Cumulative share of launches",
         ylim=(-0.025, 1.025),
     )
     inset.set(
-        xlim=(94, inset_max), ylim=(0, 0.05), xticks=range(94, inset_max + 1), yticks=[0, 0.02, 0.05]
+        xlim=(94, 98), ylim=(0, 0.05), xticks=range(94, 99), yticks=[0, 0.02, 0.05]
     )
     inset.tick_params(labelsize=8)
     inset.set_title("Detail near the $95M floor", fontsize=8, pad=3)
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=2, frameon=False)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=3, frameon=False)
     fig.savefig(OUT / filename)
 
 
-plot_allocations(traders, labels, f"{multiple}× cushion multiplier", "wealth-volatility.pdf")
-plot_cdf(series, labels, colors, styles, "terminal-cdf.pdf")
+plot_allocations(traders, progression_labels, f"{multiple}× cushion multiplier", "wealth-volatility.pdf")
+plot_cdf(overview, colors, styles, "terminal-cdf.pdf")
+
+plot_cdf(alternatives, [colors[i] for i in (3, 0, 1, 2, 4)],
+         ["-.", "--", "-", ":", "-"], "alternatives-cdf.pdf")
 
 settings, = (
-    r for r in read("smooth_launch_settings.csv", smooth_run)
-    if r["strategy"] == bt.VOL_CAPPED and r["start_month"] == launch["start_month"]
+    r for r in smooth_settings
+    if r["strategy"] == bt.VOL_CAPPED and r["start_month"] == launch.start_month
 )
-assert settings["mode"] == "calibrated"
-scale = float(settings["risk_scale"])
-pair = ["Chance-constrained DP", "Smooth cushion"]
+scale = settings["risk_scale"]
+smooth_trader = bt.launch_trader(
+    bt.VOL_CAPPED, multiple, None if settings["mode"] == "nominal warm-up" else scale,
+    settings["scale_source"],
+)
 plot_allocations(
-    [bt.ChanceConstrainedDPTrader(multiple), bt.VolCappedSmoothCushionTrader(scale)],
-    pair, f"DP multiplier {multiple}×   ·   smooth scale {scale:g}", "smooth-wealth-volatility.pdf",
+    [bt.ChanceConstrainedDPTrader(multiple), smooth_trader],
+    comparison_labels, f"Full DP multiplier {multiple}×   ·   Cushion scale {scale:g}", "smooth-wealth-volatility.pdf",
 )
-plot_cdf([dp, smooth], pair, [colors[-1], colors[1]], [styles[-1], "-"], "smooth-terminal-cdf.pdf", inset_max=98)
+plot_allocations(
+    [StochasticDPTrader(), bt.ChanceConstrainedDPTrader(multiple), smooth_trader],
+    ["Regular DP", *comparison_labels],
+    f"Full DP multiplier {multiple}×   ·   Cushion scale {scale:g}",
+    "slide-heatmaps.pdf", columns=3,
+)

@@ -3,7 +3,7 @@ from dataclasses import replace
 from datetime import date
 from unittest.mock import patch
 
-from backtest import AnnualResult, STRATEGIES, BREACH_LIMIT, VOLATILITY_GROUPS, Session, replay, run_years
+from plot_backtest import AnnualResult, STRATEGIES, BREACH_LIMIT, VOLATILITY_GROUPS, Session, replay, run_years
 from cushion_selection import HYBRID, MULTIPLIERS, select_multiplier
 
 
@@ -70,7 +70,7 @@ class CushionSelectionTests(unittest.TestCase):
                 return replay(name, Recorder(), days, *args)
 
             audit = []
-            with patch("backtest.replay", trace_january):
+            with patch("plot_backtest.replay", trace_january):
                 rows, _ = run_years(data, [HYBRID], 2020, 2020, selection_history=audit)
             return orders, audit, rows
 

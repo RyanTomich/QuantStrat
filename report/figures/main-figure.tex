@@ -1,0 +1,75 @@
+% Full DP method diagram, drawn in the presentation's Beamer colors.
+\begingroup
+\usebeamercolor{structure}
+\colorlet{dpblue}{structure.fg}
+\centering
+\begin{tikzpicture}[
+    x=1cm, y=1cm, font=\scriptsize,
+    heading/.style={text=dpblue, font=\small\bfseries},
+    label/.style={font=\scriptsize\bfseries},
+    box/.style={draw=dpblue!45, fill=dpblue!4, rounded corners=2pt,
+                align=center, inner xsep=4pt, inner ysep=3pt},
+    link/.style={-{Stealth[length=1.4mm]}, draw=black!65, thin},
+    note/.style={anchor=north west, align=left, inner sep=0pt}
+]
+% A two-session decision in the baseline model.
+\node[heading, anchor=west] at (0,6.32) {Regular DP};
+\node[anchor=east] at (13.8,6.32)
+    {$\displaystyle J_d(s)=\max_{a\in A(s)}\sum_{s'}p(s'\mid s,a)\,J_{d-1}(s')$};
+
+\node[label] at (1.20,5.66) {Current state};
+\node[label] at (4.29,5.66) {Equity decision};
+\node[label] at (8.65,5.66) {Next state};
+\node[label] at (12.05,5.66) {Continuation value};
+\node[box] (state) at (1.20,4.47)
+    {\$96M wealth\\Ordinary volatility\\2 sessions left};
+\node[box] (action) at (4.29,4.47)
+    {$a\in\{0,.25,.5,.75,1\}$\\Example: $a=.75$};
+\draw[link] (state) -- (action);
+
+\coordinate (fork) at (5.85,4.47);
+\draw[black!65] (action.east) -- (fork);
+\foreach \i/\y/\wealth/\regime/\prob in {
+    1/5.19/95.34/ordinary/49.5, 2/4.71/95.34/high/0.5,
+    3/4.23/96.70/ordinary/49.5, 4/3.75/96.70/high/0.5}{
+    \node[box, minimum width=2.52cm, inner ysep=1.8pt] (s\i) at (8.65,\y)
+        {\$\wealth M, \regime};
+    \draw[link] (fork) -- (6.34,\y) -- (s\i.west)
+        node[midway, fill=white, inner sep=1pt] {\prob\%};
+    \node (v\i) at (12.05,\y) {$J_{d-1}(s'_{\i})$};
+    \draw[link] (s\i.east) -- (v\i.west);
+    \draw[dpblue!65] (v\i.east) -- (13.22,\y);
+}
+\draw[dpblue!65] (13.22,5.19) -- (13.22,3.75);
+\draw[link, draw=dpblue!65, rounded corners=2pt]
+    (13.22,3.75) -- (13.22,3.21) -- (4.29,3.21) -- (action.south);
+\node[fill=white, text=dpblue, inner xsep=4pt] at (8.65,3.21)
+    {Weight by probability};
+
+% The three changes from regular DP to Full DP.
+\draw[black!22] (0,2.90) -- (13.8,2.90);
+\foreach \x/\title in {0/Equity cap,4.75/Downside shocks,9.38/Policy selection}
+    \node[heading, anchor=west, inner xsep=0pt] at (\x,2.57) {\title};
+\node[note, text width=4.38cm] at (0,2.17)
+    {Limit equity using the cushion above the \$95M floor.
+     With $C=(W-F)_+$ and $K=\$5\mathrm{M}$,\\[4pt]
+     $E_{\max}=\min\{W,\,m\min(C,K)$\\
+     $\hphantom{E_{\max}=\min\{W,\,}{}+1.5m(C-K)_+\}$.\\[5pt]
+     At \$96M with $m=8$, equity is capped at \textbf{\$8M}.};
+
+\node[note, text width=4.12cm] at (4.75,2.17)
+    {Add a rare loss to each regime. Ordinary-regime outcomes:};
+\coordinate (shock) at (5.02,0.90);
+\fill[dpblue] (shock) circle (1.8pt);
+\foreach \y/\outcome in {1.38/{Up \enspace(49.95\%)},
+                         0.90/{Down \enspace(49.95\%)},
+                         0.42/{Crash \enspace(0.10\%, $-10\%$)}}{
+    \node[box, anchor=west, inner ysep=1.8pt] (outcome) at (5.68,\y) {\outcome};
+    \draw[link] (shock) -- (outcome.west);
+}
+\node[note, text width=4.35cm] at (9.38,2.17)
+    {At launch, compare four penalty policies and cash. Maximize expected terminal wealth among those with breach risk below 2\%.\\[5pt]
+     $\displaystyle \pi^*\in\arg\max_{\pi\in\Pi}\mathbb E_\pi[W_T\mid s_0]$\\[3pt]
+     $\text{s.t.}\quad\Pr_\pi(W_T<F\mid s_0)<2\%$.};
+\end{tikzpicture}\par
+\endgroup

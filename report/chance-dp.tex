@@ -1,116 +1,157 @@
-% Include with \input{chance-dp}; keep the figures/ subdirectory alongside the main
-% manuscript or add their directory to \graphicspath. Requires amsmath,
-% amssymb, and graphicx.
-\subsection{The standard dynamic programming model}
-We consider a portfolio with initial wealth $W_0=\$100$ million and a nominal terminal floor $F=\$95$ million. At each trading session $t$, the investor observes wealth $W_t$ and a volatility regime $z_t$, and allocates a fraction $a_t\in\mathcal A_0=\{0,0.25,0.50,0.75,1\}$ to equity. The balance earns the daily cash rate $r_f=0.02/252$. If $X_{t+1}$ denotes the equity return in excess of cash, wealth evolves as $W_{t+1}=W_t(1+r_f+a_tX_{t+1})$.
+\documentclass[10pt]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{graphicx}
+\usepackage{placeins}
+\usepackage{float}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+% Preamble
+\usepackage{listings}
+\lstdefinestyle{modelcode}{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    frame=single,
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false,
+    breaklines=true
+}
 
-The high-volatility regime applies when the pre-trade volatility forecast exceeds its historical 80th percentile. In the planning model, the two equally likely excess returns are $\mu\pm\sigma_z/\sqrt{252}$, where $\mu=0.05/252$ and annual volatility is $0.15$ in the ordinary regime and $0.30$ in the high regime. The regime switches independently of the return shock, with daily transition probabilities of $0.01$ from ordinary to high and $0.04$ from high to ordinary.
 
-The investor values terminal wealth through $u(x)=-1/x-5(0.95-x)^+$, where $x=W_T/W_0$ and $y^+=\max(y,0)$. The second term penalizes the magnitude of a terminal shortfall. Starting from $V_T(w,z)=u(w/W_0)$, backward induction gives
+\newcommand{\rt}[1]{\textcolor{cyan}{(RT: #1)}}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO:} #1}}
+
+\setlength{\parskip}{0.35em}
+
+\begin{document}
+
+\begin{center}
+    {\large\bfseries Equity Allocation Under a Terminal Wealth Floor}\\[20pt]
+    {\small Yuru Lin, Ryan Tomich, Moritz Wassermann}\\[5pt]
+    {\small 15.456 FE Project 2 \enspace | \enspace 11/23/2026}
+\end{center}
+
+\section{Executive Summary}
+How much of a \$100 million portfolio should the committee hold in equity if the chance of finishing below \$95 million must stay at or below 2\% in each launch condition? The mandate ranks eligible strategies by certainty-equivalent terminal wealth (CE). Baseline dynamic programming (DP) penalizes a terminal shortfall in proportion to its size. Full DP selects the policy with the highest modeled mean terminal wealth among candidates that pass a breach screen at launch. In the backtest, capping equity near the floor cut breaches from 27 to two. Full DP finished below the floor once in 910 launches and led eligible strategies in CE both overall (\$109.07 million) and in each launch condition. Volatility-capped smooth cushion had no breaches.
+
+\section{Methods} \label{sec:methods}
+
+\subsection{Baseline dynamic program}
+The trader starts with $W_0=\$100$ million in cash and rebalances between equity and cash each day until a known maturity $T$. The floor $F=\$95$ million applies at maturity. Writing $x=W_T/W_0$, baseline DP maximizes expected utility $u(x)=-1/x-5(0.95-x)^+$. Gains have diminishing marginal utility, and any terminal shortfall incurs an additional penalty proportional to its size.
+
+Before each trade, the trader observes wealth $W_t$, the number of sessions remaining, and a volatility regime $z_t$. The trader estimates volatility from daily equity returns over the previous 30 trading days. The regime is high when this annualized estimate exceeds the 80th percentile of earlier estimates. Otherwise it is ordinary. The trader chooses an equity fraction $a_t\in\mathcal A_0=\{0,0.25,0.50,0.75,1\}$ and holds the balance in cash.
+
+The planning model gives equity the same expected excess return $\mu=0.05/252$ per session in both regimes. The two equally likely excess returns are $X_{t+1}=\mu\pm\sigma_{z_t}/\sqrt{252}$, with $\sigma_{z_t}=15\%$ in the ordinary regime and $30\%$ in the high regime. Independently of the shock, the regime switches with daily probability 1\% from ordinary to high or 4\% from high to ordinary. With modeled cash return $r_f=0.02/252$, the chosen equity fraction gives next-session wealth $W_{t+1}=W_t(1+r_f+a_tX_{t+1})$.
+
+Let $V_t(w,z)$ be the highest expected terminal utility attainable from wealth $w$ in regime $z$. Each equity fraction leads to a different distribution of next-session wealth. With $V_T(w,z)=u(w/W_0)$, the optimal value satisfies
 \begin{equation}
  V_t(w,z)=\max_{a\in\mathcal A_0}
- \mathbb E\!\left[V_{t+1}\bigl(w(1+r_f+aX_{t+1}),z_{t+1}\bigr)\mid z_t=z\right].
+ \mathbb E\!\left[V_{t+1}(W_{t+1},z_{t+1})\mid W_t=w,\,z_t=z,\,a_t=a\right].
 \end{equation}
+Planning interpolates continuation values between wealth grid points. In the backtest, the trader takes the action at the nearest grid point and earns the session's realized equity and cash returns.
 
-\subsection{Chance-constrained dynamic programming}
-We extend the baseline model to pursue higher mean terminal wealth while keeping the modeled probability of finishing below the floor under 2\%.
-\paragraph{Wealth-dependent equity cap.}
-The baseline model allows full equity exposure even when wealth is just above the floor. We cap equity exposure according to the dollar cushion $C(w)=(w-F)^+$. The cap allows $m$ dollars of equity exposure per dollar of cushion up to $K=\$5$ million, and $1.5m$ dollars per additional dollar of cushion. Total equity exposure is bounded by
+\subsection{From baseline to Full DP}
+We build Full DP by capping equity near the floor, adding rare losses to the planning model, and selecting a policy at launch (Figure~\ref{fig:ccdp-vol}).
+
+\paragraph{Equity cap.}
+At \$96 million, baseline DP permits full equity exposure with only \$1 million above the floor. The cap uses the actual dollar cushion $C=(w-F)^+$, a threshold $K=\$5$ million, and a multiplier $m$ to limit equity holdings to
 \begin{equation}
- E_{\max}(w)=\min\!\left\{w,\;m\min(C(w),K)+1.5m\bigl(C(w)-K\bigr)^+\right\}.
+ E_{\max}(w)=\min\!\left\{w,\;m\min(C,K)+1.5m(C-K)^+\right\}.
 \end{equation}
-The admissible dollar positions comprise the baseline positions $aw$, $a\in\mathcal A_0$, clipped to $E_{\max}(w)$, together with 25\%, 50\%, and 75\% of the cap. These intermediate positions preserve allocation choices near the floor, where several baseline positions collapse to the same cap. At or below the floor, the portfolio holds cash. Each launch retains the multiplier selected for its opening year using only previously completed investments.
+With $m=8$, for example, the trader can hold up to \$8 million against a \$1 million cushion. At or below the floor it holds cash. Each launch keeps the multiplier selected from investments completed before its launch year.
 
-\paragraph{Rare downside shocks.}
-A sharp one-day loss can exhaust the cushion even when the equity position satisfies the cap. To capture this risk, we add a rare downside shock to each regime. The model assigns a daily probability $p_z$ to an excess return $g_z$, with $(p_z,g_z)=(0.001,-0.10)$ in the ordinary regime and $(0.004,-0.20)$ in the high regime. The remaining two outcomes, $c_z\pm\sigma_z/\sqrt{252}$, each receive probability $(1-p_z)/2$. Choosing $c_z=(\mu-p_zg_z)/(1-p_z)$ preserves the baseline expected equity premium.
+\paragraph{Downside shocks.}
+A 20\% excess loss on that \$8 million position costs \$1.6 million relative to cash, enough to exhaust the cushion before the next trade. The second variant adds a rare loss to each regime. It assumes a $-10\%$ excess return with daily probability 0.1\% in the ordinary regime and a $-20\%$ excess return with probability 0.4\% in the high regime. The two remaining outcomes shift to preserve the expected premium in each regime. Both variants still choose among feasible positions using the baseline utility.
 
-\paragraph{Terminal probability constraint.}
-The baseline utility penalizes the size of a shortfall but places no limit on its probability. We impose that limit directly and maximize expected terminal wealth subject to it. For the launch state $s_0=(W_0,z_0)$ and the prescribed maturity $T$, the target problem is
+\paragraph{Policy selection.}
+The mandate counts a small terminal shortfall and a large one as one breach each. Full DP therefore uses the capped, three-outcome model to construct four candidate policies, each maximizing the expected payoff $W_T-\lambda\mathbf{1}_{\{W_T<F\}}$ for a different dollar penalty $\lambda$. Let $\Pi$ contain these four policies and the all-cash policy. Given launch wealth and regime $s_0=(W_0,z_0)$, the trader selects
 \begin{equation}
- \max_{\pi}\;\mathbb E_{\pi}[W_T\mid s_0]
- \quad\text{subject to}\quad
- \Pr_{\pi}(W_T<F\mid s_0)<0.02 .
+ \pi^*\in\underset{\pi\in\Pi}{\arg\max}\;\mathbb E_\pi[W_T\mid s_0]
+ \quad\text{subject to}\quad \Pr_\pi(W_T<F\mid s_0)<0.02 .
 \end{equation}
-We approximate this problem with four candidate policies and an all-cash alternative. For each breach penalty $\lambda\in\{0,10,100,1000\}$ million dollars, backward induction uses the terminal payoff $W_T-\lambda\mathbf{1}_{\{W_T<F\}}$ and tracks both expected terminal wealth and breach probability under the resulting policy. At launch, the strategy selects the candidate with the highest modeled mean among those satisfying the probability limit. The selected policy remains fixed through maturity, while its equity allocation responds daily to wealth, regime, and time remaining.
-
-Figures~\ref{fig:ccdp-vol} and~\ref{fig:ccdp-cdf} show the allocation rules and historical terminal wealth distributions for the four cumulative specifications. The first three maximize the original terminal utility, which isolates the effect of changing the action set and then the transition law. The fourth introduces the constrained mean-wealth objective. All four use realized equity and cash returns in the historical replay. Across 910 launches, the equity cap reduces the number of terminal breaches from 34 to one. Each subsequent specification also records one breach. Under the gap model, replacing terminal utility with the constrained mean-wealth objective raises historical mean terminal wealth from \$109.11 million to \$109.85 million.
+Both the expected wealth and the breach probability are computed under the launch model. The selected policy stays in force through maturity, adjusting its equity holding as wealth, regime, and time remaining change.
 
 \begin{figure*}[tbp]
  \centering
- \includegraphics[width=0.93\textwidth]{figures/wealth-volatility.pdf}
- \caption{Equity allocation as a function of current wealth and forecast volatility for the latest eligible 12-month launch. Each panel quotes a strategy at the same remaining horizon. Color gives the percentage of wealth invested in equity. The vertical dashed line marks the \$95 million floor and the horizontal dashed line marks the launch volatility cutoff. Panel (d) retains the policy selected at launch across all plotted states.}
+ \includegraphics[width=0.8\textwidth]{figures/wealth-volatility.pdf}
+ \caption{Equity allocation for the October 2025 launch with 251 sessions remaining. Starting from DP in panel (a), panels (b)--(d) successively add the equity cap, downside shocks, and policy selection. Color gives the percentage of wealth in equity. The vertical dashed line marks the \$95 million floor and the horizontal dashed line marks the launch volatility cutoff. Panel (d) applies the policy selected at launch to every plotted state.}
  \label{fig:ccdp-vol}
 \end{figure*}
 
-\begin{figure*}[tbp]
- \centering
- \includegraphics[width=0.87\textwidth]{figures/terminal-cdf.pdf}
- \caption{Empirical cumulative distributions of terminal wealth for 910 overlapping 12-month investments launched monthly from January 1950 through October 2025. At each wealth level, the curve gives the fraction of launches ending at or below that level. The inset spans \$94--96 million and cumulative probabilities from 0 to 5\%. Dots mark the empirical CDF at \$95 million. The three capped strategies coincide there. Horizontal dashed lines mark 2\%. The left limit at the \$95 million floor gives the historical terminal breach rate. The 2\% policy limit applies to the modeled probability at launch.}
- \label{fig:ccdp-cdf}
-\end{figure*}
+\subsection{Volatility-capped smooth cushion}
+Full DP can change its equity weight abruptly when forecast volatility crosses the regime cutoff (Figure~\ref{fig:ccdp-vol}, panel~(d)). Volatility-capped smooth cushion extends Time-aware smooth cushion by adding an equity ceiling that falls continuously as forecast volatility rises.
 
-
-\subsection{Smooth Variant}
-The chance-constrained DP heatmap suggests a simpler daily rule. Moving right in Figure~\ref{fig:ccdp-vol}(d), a larger cushion supports more equity. Moving upward, even a small change in forecast volatility can switch the regime and abruptly change the position. The smooth variant preserves the cushion response and uses the volatility forecast directly to reduce exposure gradually.
-
-\paragraph{Why discount the floor?}
-At \$100 million of wealth and 15\% forecast volatility, the October 2025 DP policy allocates 60\% to equity with 251 sessions left and 50\% with one session left. The smooth rule captures this horizon effect through the cost of funding the floor. At the modeled cash rate, the reserve needed to fund \$95 million at maturity rises from \$93.13 million to \$94.99 million between those dates. At the same wealth, this leaves \$6.87 million of cushion early in the year and only \$5.01 million on the final trading day.
+\paragraph{Funding the floor.}
+With $n=T-t$ sessions remaining, the cash reserve needed to fund the floor at the modeled cash rate is $F_n=F(1+r_f)^{-n}$. At \$100 million of wealth, the cushion $(W_t-F_n)^+$ shrinks from \$6.87 million with 251 sessions remaining to \$5.01 million with one session remaining. Early in the investment, wealth can therefore fall below \$95 million and still leave room for equity. At or below the reserve the trader holds cash.
 
 \paragraph{Daily allocation.}
-Measure wealth in millions of dollars. With $n=T-t$ sessions remaining, the reserve is $F_n=F(1+r_f)^{-n}$ and the cushion is $c=(W_t-F_n)^+$. Define base equity exposure by $G(c)=\int_0^c h(u)\,du$, where
-\[
- h(u)=1+\frac{(u-3)^+-(u-7)^+}{2}
-       +\frac{(u-15)^+-(u-25)^+}{10}.
-\]
-Each additional cushion dollar initially supports one dollar of base equity exposure. Its contribution rises gradually to three dollars over the \$3--7 million band and to four over the \$15--25 million band.
-
-For annualized forecast volatility $v$ and launch scale $s$, the rule reduces the requested equity fraction $r$ as volatility rises and sets a ceiling $L(v)$ according to
-\[
- r=1.25\,s\,\frac{3}{[1+(v/0.10)^6]^{1/6}}\frac{G(c)}{W_t},
- \qquad L(v)=\frac{1}{1+(v/0.30)^4}.
-\]
-Each session the strategy rebalances to equity holdings of $a_t W_t$, where the target fraction is
-\[
- a_t=\frac{r}{[1+(r/L(v))^4]^{1/4}}.
-\]
-Near the reserve, the rule grants approximately the requested fraction. With ample cushion, the weight approaches the volatility ceiling, which falls from 50\% at 30\% volatility to 24\% at 40\% volatility (Figure~\ref{fig:smooth-vol}). The breakpoints and ceiling are design choices motivated by the DP surface. Each one-year launch inherits the scale selected on completed launches for the earlier time-aware cushion rule. During sparse-history warm-up it uses unit scale and the nominal floor.
-
-Table~\ref{tab:strategy-overview} compares all five strategies on the same 12-month launches. Table~\ref{tab:strategy-comparison} then compares the final two strategies on the committee's objective and floor. The chance-constrained DP achieved higher overall certainty-equivalent wealth at both horizons, while the smooth rule achieved higher certainty-equivalent wealth on crisis launches at both horizons. Of these two strategies, only the DP breached the floor, on one lower-volatility 12-month launch. Over all 12-month launches, the worst finish was \$94.996 million for the DP and \$95.230 million for the smooth rule. Figure~\ref{fig:smooth-cdf} shows the crossing distributions near the floor.
-
-\begin{table*}[tbp]
- \centering
- \caption{Certainty-equivalent wealth, mean terminal wealth, and floor breaches for 910 overlapping 12-month investments of \$100 million each, launched monthly from January 1950 through October 2025. A launch is classified as crisis if the equity total-return index closed at least 20\% below its trailing 12-month high on the previous trading day. For all other launches, higher volatility means that the volatility of daily equity returns over the preceding 63 trading sessions exceeded the median across all earlier 63-session windows. Lower volatility includes values at or below that median.}
- \label{tab:strategy-overview}
- \small
- \input{figures/strategy-overview.tex}
- \par\smallskip
- \begin{minipage}{0.96\linewidth}\footnotesize
- For each launch group, the objective value at $\gamma=2$ is $\mathrm{CE}=(n^{-1}\sum_{i=1}^{n}1/W_{T,i})^{-1}$. Breaches count finishes strictly below \$95 million. Percentages use the same group. Within each group, bold marks the highest CE among strategies with observed breach rates at or below 2\% in every launch condition, the highest arithmetic mean, and the fewest breaches (including ties).
- \end{minipage}
-\end{table*}
-
-\begin{table*}[tbp]
- \centering
- \caption{Historical certainty-equivalent terminal wealth and floor breaches from a \$100 million investment, by market condition at launch.}
- \label{tab:strategy-comparison}
- \small
- \input{figures/strategy-comparison.tex}
- \par\smallskip
- \begin{minipage}{0.96\linewidth}\footnotesize
- CE is the harmonic mean of terminal wealth ($\gamma=2$). Breaches count launches finishing strictly below \$95 million, with the observed rate in parentheses. Monthly launches overlap, so these rates alone cannot establish a 2\% upper bound on breach probability. The smooth rule uses its historically selected scale at 12 months and a fixed scale of one at 24 months.
- \end{minipage}
-\end{table*}
+Each additional dollar of cushion supports one dollar of base equity exposure at small cushions and up to four at large cushions. Higher forecast volatility reduces both the target weight and its ceiling (Figure~\ref{fig:smooth-vol}). At 30\% annualized volatility, the ceiling is 50\% equity. The trader inherits the launch scale selected for Time-aware smooth cushion. With insufficient history it uses a scale of one and the nominal floor as its reserve.
 
 \begin{figure*}[tbp]
  \centering
- \includegraphics[width=0.93\textwidth]{figures/smooth-wealth-volatility.pdf}
- \caption{Equity weights for the same October 2025 launch and wealth--volatility grid as Figure~\ref{fig:ccdp-vol}. The vertical line marks the nominal terminal floor. The horizontal line marks the DP regime cutoff, shown on both panels for reference. Both policies retain their launch settings.}
+ \includegraphics[width=0.74\textwidth]{figures/smooth-wealth-volatility.pdf}
+ \caption{Equity weights for the October 2025 launch. The dashed lines mark the daily regime cutoff and the \$95 million nominal floor.}
  \label{fig:smooth-vol}
 \end{figure*}
 
-\begin{figure*}[tbp]
+
+\section{Results} \label{sec:results}
+We replayed daily U.S. equity market and cash returns from the \href{https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html}{Fama/French daily factors} for 910 overlapping 12-month investments launched monthly from January 1950 through October 2025. CE is the harmonic mean of terminal wealth ($\gamma=2$). A breach is a finish strictly below \$95 million. A launch is in crisis if the equity index closed at least 20\% below its trailing 12-month high on the previous session. For reporting, we classify the remaining launches as higher or lower volatility according to whether their 63-session volatility at launch exceeded its historical median. Annual trading settings use only launches completed before the selection year. We chose 30 trading days near the middle of the 10--42-day range selected when we ranked eligible lookbacks from 2 to 252 days by CE on completed launches at the start of each decade from 1970 through 2020.
+
+\subsection{Historical performance}
+Adding the equity cap reduced breaches from 27 to two (Table~\ref{tab:strategy-overview}). Adding downside shocks reduced the count to one. Policy selection then raised mean terminal wealth from \$109.52 million to \$110.17 million, also with one breach.
+
+Full DP led Volatility-capped smooth cushion by \$0.70 million in overall CE and by \$0.99 million across the 54 crisis launches. The cushion strategy finished every launch above the floor, with a minimum of \$96.210 million. Full DP's single breach, on a lower-volatility launch, missed the floor by about \$8,500 (Figure~\ref{fig:ccdp-cdf}).
+
+\begin{figure}[H]
  \centering
- \includegraphics[width=0.87\textwidth]{figures/smooth-terminal-cdf.pdf}
- \caption{Terminal wealth for the chance-constrained DP and smooth cushion on the same 910 monthly launches as Figure~\ref{fig:ccdp-cdf}. The inset shows the share finishing at or below each wealth level from \$94 to \$98 million. Dots mark the share at \$95 million and the horizontal dashed line marks 2\%.}
- \label{fig:smooth-cdf}
-\end{figure*}
+ \includegraphics[width=0.70\textwidth]{figures/terminal-cdf.pdf}
+ \caption{Empirical distribution of terminal wealth. At the \$95 million floor, the equity-cap variant has two breaches and each subsequent DP variant has one. The dashed horizontal line marks 2\%.}
+ \label{fig:ccdp-cdf}
+\end{figure}
+
+\begin{table}[!htbp]
+ \centering
+ \caption{Terminal wealth and breaches by launch condition. Each $+$ row adds one feature to the preceding policy, ending with Full DP.}
+ \label{tab:strategy-overview}
+ \small
+ \renewcommand{\arraystretch}{0.93}
+ \input{figures/strategy-overview.tex}
+ \par\smallskip
+ \begin{minipage}{0.85\linewidth}\footnotesize
+ Within each group, bold marks the highest CE among strategies meeting the observed 2\% breach limit in every group, the highest mean, and the fewest breaches.
+ \end{minipage}
+\end{table}
+
+\FloatBarrier
+\subsection{Alternatives}
+For each family, Table~\ref{tab:alternatives} reports the highest overall CE among candidates with observed breach rates at or below 2\% in every launch condition, using the full evaluation sample. Fixed 60/40 exceeded the limit in every group and serves as a benchmark. The closest eligible non-DP strategy, Time-aware smooth cushion, gave up \$0.44 million of CE relative to Full DP and breached twice.
+
+\begin{figure}[H]
+ \centering
+ \includegraphics[width=0.78\textwidth]{figures/alternatives-cdf.pdf}
+ \caption{Terminal wealth for the strategies in Table~\ref{tab:alternatives}. The inset shows outcomes near the \$95 million floor.}
+ \label{fig:alternatives-cdf}
+\end{figure}
+
+\begin{table}[!htbp]
+ \centering
+ \caption{Full DP and the representative of each alternative family, across all launches.}
+ \label{tab:alternatives}
+ \small
+ \input{figures/alternatives-overview.tex}
+\end{table}
+
+\FloatBarrier
+\section{Discussion}
+\subsection{Expected Performance}
+\subsection{Proof it satisfies the constraints}
+\subsection{When to use the strategy}
+
+\appendix
+\section{AI Use}
+\end{document}

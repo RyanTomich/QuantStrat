@@ -1,4 +1,4 @@
-"""Replay overlapping fixed-horizon investments starting each month against the common daily trader interface."""
+"""Run a historical trading experiment and write its results, charts, and allocation heatmaps."""
 
 import argparse
 import csv
@@ -8,16 +8,23 @@ import math
 import shlex
 import sys
 from bisect import insort
+from calendar import monthrange
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, datetime, timedelta, timezone
-from calendar import monthrange
 from functools import partial
+from itertools import groupby
+from math import ceil
 from pathlib import Path
 from statistics import fmean, harmonic_mean, median, stdev
 from tempfile import mkdtemp
 
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.ticker import PercentFormatter
+
 from cushion_selection import HYBRID, MULTIPLIERS, SMOOTH_SCALES, TIME_AWARE, select_multiplier, select_smooth_scale
+from plot_allocation_heatmaps import ReferencePath, write_allocation_heatmaps
 from trader import (
     AggressiveTieredCushionTrader, ChanceConstrainedDPTrader, DiscountedFloorDPTrader, SplitDPTrader,
     FLOOR, FixedSplitTrader, FloorAwareGlideTrader, FloorAwareVolatilityTargetTrader,
@@ -52,6 +59,8 @@ STRATEGIES = {
 }
 INITIAL = 100_000_000.0
 BREACH_LIMIT = 0.02
+DEFAULT_VOL_LOOKBACK = 30
+LAUNCH_CONDITION_LOOKBACK = 63
 VOLATILITY_GROUPS = ("lower-volatility", "higher-volatility")
 CONDITIONS = (*VOLATILITY_GROUPS, "crisis")
 
@@ -115,6 +124,13 @@ def read_sessions(data: bytes) -> list[Session]:
     if not sessions:
         raise ValueError("No daily returns found")
     return sessions
+
+
+def rolling_daily_volatilities(returns, lookback):
+    """Estimate j uses only the returns before session j + lookback."""
+    if type(lookback) is not int or lookback < 2:
+        raise ValueError("volatility lookback must be an integer of at least 2 sessions")
+    return [stdev(returns[i:i + lookback]) for i in range(len(returns) - lookback)]
 
 
 def annual_volatility_signals(daily_vols: list[float]) -> list[tuple[float, float | None]]:
@@ -209,7 +225,8 @@ def launch_trader(name, multiplier, scale, vol_capped_scale_source="incumbent"):
 
 def run_years(sessions, names, start, end, *, horizon_months=12, selection_history=None,
               episodes=None, smooth_selection_history=None, reference_paths=None,
-              vol_capped_scale_source="incumbent", smooth_launch_settings=None):
+              vol_capped_scale_source="incumbent", smooth_launch_settings=None,
+              vol_lookback=DEFAULT_VOL_LOOKBACK):
     if type(horizon_months) is not int or horizon_months < 1:
         raise ValueError("horizon_months must be a positive integer")
     if vol_capped_scale_source not in ("incumbent", "fixed-1"):
@@ -231,10 +248,10 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
         month_end -= timedelta(days=1)
     last_month = last.year * 12 + last.month - 1
     returns = [s.equity_return for s in sessions]
-    lookback = 63
-    # Forecast j is available before session j + lookback.
-    vols = [stdev(returns[i:i + lookback]) for i in range(len(returns) - lookback)]
+    vols = rolling_daily_volatilities(returns, vol_lookback)
     signals = annual_volatility_signals(vols)
+    launch_vols = (vols if vol_lookback == LAUNCH_CONDITION_LOOKBACK
+                   else rolling_daily_volatilities(returns, LAUNCH_CONDITION_LOOKBACK))
 
     results, excluded = [], {}
     adaptive = HYBRID in names or any(name in DP_VARIANTS for name in names)
@@ -258,7 +275,7 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
         if month not in offsets:
             excluded[label] = "no start-month data"
             continue
-        index = offsets[month] - lookback
+        index = offsets[month] - vol_lookback
         if index < 252:
             excluded[label] = "insufficient pre-start volatility history"
             continue
@@ -270,7 +287,6 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
         # Include the last session of the final calendar month.
         days = sessions[offsets[month]:stops[final_month]]
         daily_signals = signals[index:index + len(days)]
-        threshold = median(vols[:index])
         if adaptive:
             if year >= start and year != selection_year:
                 selected, audit = select_multiplier(history, first_session[year], VOLATILITY_GROUPS, BREACH_LIMIT)
@@ -278,9 +294,17 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
                     selection_history.extend(dict(strategy=HYBRID, **row) for row in audit)
                 dp_reason = audit[0]["reason"]
                 selection_year = year
+            calibration_median = median(vols[:index])
             for m in MULTIPLIERS:
                 trader = STRATEGIES[HYBRID](multiplier=m)
-                history[m].append(replay(HYBRID, trader, days, vols[index], threshold, daily_signals))
+                history[m].append(replay(HYBRID, trader, days, vols[index], calibration_median, daily_signals))
+        # All strategies are scored in the same launch groups across trading lookbacks.
+        launch_index = offsets[month] - LAUNCH_CONDITION_LOOKBACK
+        if launch_index < 252:
+            excluded[label] = "insufficient pre-start volatility history"
+            continue
+        launch_vol = launch_vols[launch_index]
+        threshold = median(launch_vols[:launch_index])
         starting_drawdown = drawdowns[offsets[month] - 1]
         if starting_drawdown is None:
             excluded[label] = "insufficient pre-start drawdown history"
@@ -294,24 +318,25 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
                 smooth_year = year
             for candidate in SMOOTH_SCALES:
                 outcome = replay(TIME_AWARE, TimeAwareSmoothCushionTrader(candidate), days,
-                                 vols[index], threshold, daily_signals)
+                                 launch_vol, threshold, daily_signals)
                 condition = "crisis" if is_crisis(starting_drawdown) else outcome.condition
                 smooth_history[candidate].append(replace(outcome, condition=condition))
         if year < start:
             continue
         if reference_paths is not None:
-            latest = (days, daily_signals, vols[index], threshold, selected, scale, dp_reason, smooth_mode)
+            latest = (days, daily_signals, launch_vol, threshold, selected, scale, dp_reason, smooth_mode)
         for name in names:
             if name == HYBRID:
-                outcome = history[selected][-1]
+                outcome = replace(history[selected][-1], starting_volatility=launch_vol, median_volatility=threshold,
+                                  condition=VOLATILITY_GROUPS[launch_vol > threshold])
             elif name == TIME_AWARE:
                 if scale is None:
-                    outcome = replay(name, SmoothCushionTrader(), days, vols[index], threshold, daily_signals)
+                    outcome = replay(name, SmoothCushionTrader(), days, launch_vol, threshold, daily_signals)
                 else:
                     outcome = smooth_history[scale][-1]
             else:
                 trader = launch_trader(name, selected, scale, vol_capped_scale_source)
-                outcome = replay(name, trader, days, vols[index], threshold, daily_signals)
+                outcome = replay(name, trader, days, launch_vol, threshold, daily_signals)
             if smooth_launch_settings is not None and name in (VOL_CAPPED, TIME_AWARE, FIXED_SMOOTH):
                 matched = name == TIME_AWARE or (name == VOL_CAPPED and match_incumbent)
                 smooth_launch_settings.append(dict(
@@ -322,8 +347,6 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
             results.append(replace(outcome, starting_drawdown=starting_drawdown, horizon_months=horizon_months,
                                    condition="crisis" if is_crisis(starting_drawdown) else outcome.condition))
     if latest is not None:
-        from allocation_heatmaps import ReferencePath
-
         days, daily_signals, vol, threshold, selected, scale, dp_reason, smooth_mode = latest
         for name in names:
             trader = launch_trader(name, selected, scale, vol_capped_scale_source)
@@ -342,41 +365,51 @@ def run_years(sessions, names, start, end, *, horizon_months=12, selection_histo
     return results, {month: reason for month, reason in excluded.items() if int(month[:4]) >= start}
 
 
+def write_csv(path, rows, fieldnames=None):
+    """Write records, omitting optional tables with no rows."""
+    if fieldnames is None:
+        if not rows:
+            return
+        fieldnames = rows[0].keys()
+    with path.open("w", newline="", encoding="utf-8") as out:
+        writer = csv.DictWriter(out, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def schedule_sensitivity(rows, horizon):
     counts = defaultdict(lambda: [0, 0])
     for row in rows:
         day = row.first_session
         offset = (day.year * 12 + day.month - 1) % horizon
-        count = counts[offset]
-        count[0] += row.floor_breach
-        count[1] += 1
-    if not counts:
-        return "—", "—", f"0/{horizon}"
-    offsets = sorted(counts)
+        counts[offset][0] += row.floor_breach
+        counts[offset][1] += 1
+
     def rate(offset):
-        hits, total = counts[offset]
-        return hits / total
-    def describe(offset):
-        hits, total = counts[offset]
-        return f"{hits}/{total} ({rate(offset):.2%}, offset {offset})"
-    return describe(min(offsets, key=rate)), describe(max(offsets, key=rate)), f"{len(offsets)}/{horizon}"
+        breaches, starts = counts[offset]
+        return breaches / starts
+
+    offsets = sorted(counts)
+    stats = dict(schedules_represented=len(offsets), horizon_months=horizon)
+    for label, select in (("lowest", min), ("highest", max)):
+        offset = select(offsets, key=rate, default=None)
+        breaches, starts = counts[offset] if offset is not None else (None, None)
+        stats[f"{label}_schedule_offset"] = offset
+        stats[f"{label}_schedule_breaches"] = breaches
+        stats[f"{label}_schedule_starts"] = starts
+        stats[f"{label}_schedule_rate"] = breaches / starts if starts else None
+    return stats
 
 
 def episode_report(rows, episodes):
-    lines = ["", "## Leave-one-crisis-out sensitivity", "",
-             "Each episode is a consecutive spell of crisis closes. Exclusions are evaluated separately. "
-             "Change is the remaining breach rate minus the headline rate, in percentage points.", "",
-             "| Crisis closes (inclusive) | Strategy | Launch state | Exposed breaches/starts | "
-             "Remaining breaches/starts | Change (pp) |", "|---|---|---|---:|---:|---:|"]
     groups = defaultdict(list)
     for row in rows:
         groups[row.strategy, "all"].append(row)
         groups[row.strategy, row.condition].append(row)
-    found = False
+    records = []
     for first, last in episodes:
         if not any(r.first_session <= last and r.last_session >= first for r in rows):
             continue
-        found = True
         for name in dict.fromkeys(r.strategy for r in rows):
             for condition in ("all", *CONDITIONS):
                 group = groups[name, condition]
@@ -385,65 +418,46 @@ def episode_report(rows, episodes):
                 total_hits = sum(r.floor_breach for r in group)
                 remaining = len(group) - len(exposed)
                 remaining_hits = total_hits - hits
-                delta = "—"
-                if remaining:
-                    delta = f"{100 * (remaining_hits / remaining - total_hits / len(group)):+.2f}"
-                lines.append(f"| {first} to {last} | {name} | {condition} | {hits}/{len(exposed)} | "
-                             f"{remaining_hits}/{remaining} | {delta} |")
-    if not found:
-        lines.extend(["", "No crisis closes intersect eligible launches."])
-    return lines
+                delta = 100 * (remaining_hits / remaining - total_hits / len(group)) if remaining else None
+                records.append(dict(first_close=first, last_close=last, strategy=name, condition=condition,
+                                    exposed_breaches=hits, exposed_starts=len(exposed), remaining_breaches=remaining_hits,
+                                    remaining_starts=remaining, change_percentage_points=delta))
+    return records
 
 
 def summary_row(name, condition, rows, horizon=12):
-    prefix = f"| {name} | {condition} | {len(rows)} |"
-    sensitivity = " | ".join(schedule_sensitivity(rows, horizon)) + " |"
-    if not rows:
-        return prefix + " — | — | — | — | — | — | " + sensitivity
     breaches = sum(r.floor_breach for r in rows)
-    rate = breaches / len(rows)
-    ce = harmonic_mean(r.terminal_wealth for r in rows)
+    rate = breaches / len(rows) if rows else None
     returns = [r.total_return for r in rows]
-    return (f"{prefix} ${ce:,.2f} | {breaches} ({rate:.2%}) | {'yes' if rate > BREACH_LIMIT else 'no'} |"
-            f" {fmean(returns):.2%} | {min(returns):.2%} | {max(r.max_drawdown for r in rows):.2%} | " + sensitivity)
+    return dict(strategy=name, condition=condition, starts=len(rows),
+                ce_wealth=harmonic_mean(r.terminal_wealth for r in rows) if rows else None,
+                floor_breaches=breaches, breach_rate=rate, above_breach_limit=rate > BREACH_LIMIT if rows else None,
+                mean_return=fmean(returns) if rows else None, worst_return=min(returns, default=None),
+                max_drawdown=max((r.max_drawdown for r in rows), default=None),
+                **schedule_sensitivity(rows, horizon))
 
 
-def smooth_comparison(results, names, selections):
-    mode = {r["selection_date"].year: r["mode"] for r in selections}
+def smooth_comparison(results, names):
     launches = {r.start_month: r for r in results if r.strategy == TIME_AWARE}
-    counts = {label: sum(mode[r.year] == label for r in launches.values())
-              for label in ("nominal warm-up", "calibrated", "cash fallback")}
-    lines = ["", "## Time-aware smooth cushion", "",
-             ", ".join(f"{label}: {count} launches" for label, count in counts.items()), "",
-             "Matched starts, ordered by group feasibility and then arithmetic mean terminal wealth. "
-             "Every launch group must have an observed breach rate strictly below 2%. "
-             "Dollar figures are in millions.", "",
-             "| Strategy | Meets group limit | Mean | Paired mean gain over time-aware | CE | Worst |",
-             "|---|---|---:|---:|---:|---:|"]
-    ranking = []
+    records = []
     for name in names:
         group = [r for r in results if r.strategy == name]
         if {r.start_month for r in group} != launches.keys():
             raise ValueError("Smooth comparisons require identical monthly starts")
         feasible = all(sum(r.floor_breach for r in group if r.condition == c)
                        < BREACH_LIMIT * sum(r.condition == c for r in group) for c in CONDITIONS)
-        values = [r.terminal_wealth / 1e6 for r in group]
-        gain = fmean((r.terminal_wealth - launches[r.start_month].terminal_wealth) / 1e6 for r in group)
-        mean = fmean(values)
-        ranking.append((feasible, mean, f"| {name} | {'yes' if feasible else 'no'} | {mean:.3f} | "
-                        f"{gain:+.3f} | {harmonic_mean(values):.3f} | {min(values):.3f} |"))
-    return lines + [row for _, _, row in sorted(ranking, reverse=True)]
+        values = [r.terminal_wealth for r in group]
+        gain = fmean(r.terminal_wealth - launches[r.start_month].terminal_wealth for r in group)
+        records.append(dict(strategy=name, meets_group_limit=feasible, mean_wealth=fmean(values),
+                            mean_gain_over_time_aware=gain, ce_wealth=harmonic_mean(values), worst_wealth=min(values)))
+    return sorted(records, key=lambda row: (row["meets_group_limit"], row["mean_wealth"]), reverse=True)
 
 
 def vol_capped_comparison(results, names):
     """Compare terminal dollars and CE on exactly the same launches in each group."""
     outcomes = {name: {row.start_month: row for row in results if row.strategy == name} for name in names}
     capped = outcomes[VOL_CAPPED]
-    lines = ["", "## Volatility-capped smooth cushion", "",
-             "Dollar figures are millions. Paired differences are capped minus the named strategy. "
-             "Compare CE among strategies with at most 2% breaches in each launch group.", "",
-             "| Strategy | Launch condition | Starts | Mean wealth | Worst wealth | CE | Paired Δ mean | Paired Δ CE |",
-             "|---|---|---:|---:|---:|---:|---:|---:|"]
+    records = []
     for name, group in outcomes.items():
         if group.keys() != capped.keys() or any(row.condition != capped[m].condition for m, row in group.items()):
             raise ValueError("Volatility-capped comparisons require identical starts and launch conditions")
@@ -451,19 +465,184 @@ def vol_capped_comparison(results, names):
             months = [m for m, row in group.items() if condition == "all" or row.condition == condition]
             if not months:
                 continue
-            values = [group[m].terminal_wealth / 1e6 for m in months]
-            paired = [capped[m].terminal_wealth / 1e6 for m in months]
+            values = [group[m].terminal_wealth for m in months]
+            paired = [capped[m].terminal_wealth for m in months]
             ce = harmonic_mean(values)
-            gain = fmean(a - b for a, b in zip(paired, values))
-            lines.append(f"| {name} | {condition} | {len(months)} | {fmean(values):.3f} | {min(values):.3f} | "
-                         f"{ce:.3f} | {gain:+.3f} | {harmonic_mean(paired)-ce:+.3f} |")
-    return lines
+            records.append(dict(strategy=name, condition=condition, starts=len(months), mean_wealth=fmean(values),
+                                worst_wealth=min(values), ce_wealth=ce,
+                                capped_minus_strategy_mean=fmean(a - b for a, b in zip(paired, values)),
+                                capped_minus_strategy_ce=harmonic_mean(paired) - ce))
+    return records
+
+
+STRATEGY_COLORS = {
+    "smooth-cushion-4x": "#3E5495",
+    "tiered-cushion-3x": "#C52577",
+    "vol-scaled-cushion": "#B14356",
+    "vol-target": "#755094",
+    "floor-aware-vol-target": "#337D8C",
+    "high-vol-reduction": "#A85B12",
+    "fixed-split": "#0072B2",
+    "glide-65-35": "#D55E00",
+    "floor-aware-glide": "#00805E",
+}
+
+
+def write_terminal_wealth_ecdf(folder, results, names, conditions, floor, breach_limit, horizon=12):
+    floor_m = floor / 1_000_000
+    wealth = [floor_m, *(r.terminal_wealth / 1_000_000 for r in results)]
+    pad = max(1, (max(wealth) - min(wealth)) * .05)
+    limits = (min(wealth) - pad, max(wealth) + pad)
+
+    fig = Figure(figsize=(13, 7.2), layout="constrained")
+    axes = fig.subplot_mosaic([["full", "zoom"], ["states", "states"]],
+                              gridspec_kw={"height_ratios": [1.6, 1]})
+    ax, zoom, score = axes["full"], axes["zoom"], axes["states"]
+    ax.set(title=f"Distribution of {horizon}-month terminal wealth",
+           xlim=limits, ylim=(-.025, 1.025), ylabel="Cumulative share of monthly starts")
+    zoom.set(title=f"Detail near the ${floor_m:g}M floor", xlim=(floor_m - 2, floor_m + 2),
+             ylim=(-.002, 2.5 * breach_limit))
+    for panel in (ax, zoom):
+        panel.set_xlabel("Terminal wealth threshold ($ millions)")
+        panel.spines[["top", "right"]].set_visible(False)
+        panel.grid(axis="y", alpha=.17)
+        panel.set_axisbelow(True)
+        panel.yaxis.set_major_formatter(PercentFormatter(1, decimals=0))
+        panel.axvspan(panel.get_xlim()[0], floor_m, color="#fbe9e6", zorder=0)
+        panel.axhline(breach_limit, color="#414141", linestyle="--", linewidth=1.2,
+                      label=f"{breach_limit:.0%} limit")
+        panel.axvline(floor_m, color="#666666", linewidth=1, label=f"${floor_m:g}M floor", zorder=1)
+    for index, name in enumerate(names):
+        group = [r for r in results if r.strategy == name]
+        if not group:
+            continue
+        color = STRATEGY_COLORS.get(name, f"C{index % 10}")
+        values = sorted(r.terminal_wealth / 1_000_000 for r in group)
+        xs, ys = [limits[0]], [0.]
+        count = 0
+        for value, ties in groupby(values):
+            count += sum(1 for _ in ties)
+            xs.append(value)
+            ys.append(count / len(values))
+        rate = sum(r.floor_breach for r in group) / len(group)
+        for panel in (ax, zoom):
+            panel.step(xs + [max(limits[1], panel.get_xlim()[1])], ys + [1.],
+                       where="post", color=color, linewidth=1.6, label=name)
+            panel.scatter(floor_m, rate, color=color, edgecolor="white", zorder=4)
+    zoom.legend(loc="center left", bbox_to_anchor=(1, .5), frameon=False, handlelength=3)
+    if not results:
+        ax.text(.5, .5, "No eligible monthly starts", transform=ax.transAxes, ha="center")
+    score.set_title(f"Share finishing below ${floor_m:g}M by starting condition", loc="left")
+    score.axhline(breach_limit, color="#414141", linestyle="--", linewidth=1.4,
+                  label=f"{breach_limit:.0%} limit")
+    for offset, marker, condition in zip((-.18, 0, .18), ("o", "^", "D"), conditions):
+        xs, rates = [], []
+        for index, name in enumerate(names):
+            group = [r for r in results if r.strategy == name and r.condition == condition]
+            if group:
+                xs.append(index + offset)
+                rates.append(sum(r.floor_breach for r in group) / len(group))
+        score.scatter(xs, rates, marker=marker, s=48, label=condition.capitalize(), zorder=3)
+    score.set_xticks(range(len(names)), [name.replace("-", "-\n", 1) for name in names])
+    score.set_xlim(-.5, len(names) - .5)
+    score.set_ylim(bottom=-.055 * score.get_ylim()[1])
+    score.yaxis.set_major_formatter(PercentFormatter(1, decimals=1))
+    score.spines[["top", "right"]].set_visible(False)
+    score.legend(loc="center left", bbox_to_anchor=(1, .5), frameon=False)
+    fig.savefig(folder / "terminal_wealth_distribution.png", dpi=160)
+
+
+def ce(values, axis=None):
+    # Zero terminal wealth makes the harmonic mean zero.
+    with np.errstate(divide="ignore"):
+        return 1 / np.mean(1 / values, axis=axis)
+
+
+def paired_intervals(months, hybrid, other):
+    """Moving-block bootstrap, drawing the same contiguous months for both policies."""
+    n = len(months)
+    size = 12
+    starts = [i for i in range(n - size + 1) if months[i + size - 1] - months[i] == size - 1]
+    if not starts:
+        return None, None, None, None
+    rng = np.random.default_rng(1950)
+    estimates = []
+    for _ in range(2000):
+        blocks = rng.choice(starts, size=ceil(n / size))
+        index = (blocks[:, None] + np.arange(size)).ravel()[:n]
+        a, b = hybrid[index], other[index]
+        estimates.append([ce(a) - ce(b), (a - b).mean()])
+    lo, hi = np.percentile(estimates, [2.5, 97.5], axis=0)
+    return lo[0], hi[0], lo[1], hi[1]
+
+
+def comparison_report(folder, results, names, floor):
+    rows = {name: sorted((r for r in results if r.strategy == name), key=lambda r: r.start_month)
+            for name in names}
+    starts = [r.start_month for r in rows[HYBRID]]
+    months = np.array([12 * int(m[:4]) + int(m[5:]) for m in starts])
+    wealth = {}
+    distribution = []
+    fig = Figure(figsize=(10, 4.5), layout="constrained")
+    ax, zoom = fig.subplots(1, 2)
+    floor_m = floor / 1e6
+    for name, group in rows.items():
+        if [r.start_month for r in group] != starts:
+            raise ValueError("Paired comparison requires identical monthly starts")
+        wealth[name] = np.array([r.terminal_wealth for r in group])
+        dollars = np.sort(wealth[name])
+        distribution.append(dict(strategy=name, mean_wealth=dollars.mean(), median_wealth=np.median(dollars),
+                                 p05_wealth=np.percentile(dollars, 5),
+                                 worst_1pct_mean_wealth=dollars[:ceil(.01 * len(dollars))].mean(),
+                                 largest_shortfall=max(0, floor - dollars[0])))
+        values = dollars / 1e6
+        for axis in (ax, zoom):
+            axis.step(np.r_[min(values[0], floor_m - 2), values, max(values[-1], floor_m + 3)],
+                      np.r_[0, np.arange(1, len(values) + 1) / len(values), 1],
+                      where="post", label=name)
+    for axis in (ax, zoom):
+        axis.axvline(floor_m, color="gray", linestyle="--")
+        axis.yaxis.set_major_formatter(PercentFormatter(1))
+        axis.set_xlabel("Terminal wealth ($ millions)")
+    ax.set(title="All monthly starts", ylabel="Cumulative share")
+    ax.legend(fontsize="small")
+    zoom.set(title="Outcomes near the floor", xlim=(floor_m - 2, floor_m + 3), ylim=(-.002, .15))
+    fig.savefig(folder / "cushion_distribution.png", dpi=160)
+    write_csv(folder / "cushion_distribution.csv", distribution)
+    gains = []
+    for name in names:
+        if name == HYBRID:
+            continue
+        a, b = wealth[HYBRID], wealth[name]
+        ce_low, ce_high, mean_low, mean_high = paired_intervals(months, a, b)
+        retained = None
+        if name == "stochastic-dp" and "smooth-cushion-4x" in wealth:
+            baseline = ce(wealth["smooth-cushion-4x"])
+            advantage = ce(b) - baseline
+            if advantage > 0:
+                retained = (ce(a) - baseline) / advantage
+        gains.append(dict(comparator=name, combined_minus_comparator_ce=ce(a) - ce(b),
+                          combined_minus_comparator_mean=(a - b).mean(), ce_gain_ci_low=ce_low, ce_gain_ci_high=ce_high,
+                          mean_gain_ci_low=mean_low, mean_gain_ci_high=mean_high, share_of_ce_advantage_retained=retained))
+    write_csv(folder / "cushion_paired_gains.csv", gains)
+
+    decades = []
+    buckets = sorted({(r.year // 10 * 10, r.condition) for r in rows[HYBRID]})
+    for decade, condition in buckets:
+        for name, group in rows.items():
+            subset = [r for r in group if r.year // 10 * 10 == decade and r.condition == condition]
+            values = np.array([r.terminal_wealth for r in subset])
+            decades.append(dict(decade=decade, condition=condition, strategy=name, starts=len(subset),
+                                ce_wealth=ce(values), mean_wealth=values.mean(), floor_breaches=sum(r.floor_breach for r in subset)))
+    write_csv(folder / "cushion_by_decade.csv", decades)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategy", action="append", choices=STRATEGIES)
     parser.add_argument("--horizon-months", type=int, default=12)
+    parser.add_argument("--vol-lookback", type=int, default=DEFAULT_VOL_LOOKBACK,
+                        help="Trading sessions in the volatility estimate (default: %(default)s)")
     parser.add_argument("--vol-capped-scale-source", choices=("incumbent", "fixed-1"), default="incumbent")
     parser.add_argument("--start-year", type=int)
     parser.add_argument("--end-year", type=int)
@@ -486,72 +665,47 @@ def main(argv=None):
         results, excluded = run_years(sessions, names, start, end, horizon_months=horizon, episodes=episodes,
                                       selection_history=selections, smooth_selection_history=smooth_selections,
                                       reference_paths=reference_paths, vol_capped_scale_source=args.vol_capped_scale_source,
-                                      smooth_launch_settings=launch_settings if VOL_CAPPED in names else None)
+                                      smooth_launch_settings=launch_settings if VOL_CAPPED in names else None,
+                                      vol_lookback=args.vol_lookback)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
 
-    from backtest_figures import write_figures
-
-    included = sorted({r.start_month for r in results})
-    lines = [f"# {horizon}-month backtest with monthly starts", "",
-             f"Command: `{shlex.join(['python3', 'backtest.py', *(sys.argv[1:] if argv is None else argv)])}`",
-             f"Data: `{args.data}` (SHA-256 `{hashlib.sha256(data).hexdigest()}`)",
-             f"Requested start years: {start}–{end}",
-             f"Eligible monthly starts: {len(included)}" + (f" ({included[0]} through {included[-1]})" if included else ""),
-             "Excluded start months: " + (", ".join(f"{y} ({why})" for y, why in excluded.items()) or "none"), ""]
-    table = [
-        "| Strategy | Starting condition | Monthly starts | CE (γ = 2) | Finished below $95M | Observed above 2%? | Mean horizon return | Worst horizon return | Maximum drawdown | Lowest schedule rate | Highest schedule rate | Schedules represented |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for name in names:
-        rows = [r for r in results if r.strategy == name]
-        table.append(summary_row(name, "all", rows, horizon))
-        for condition in CONDITIONS:
-            table.append(summary_row(name, condition, [r for r in rows if r.condition == condition], horizon))
-    lines.extend(table)
-    if VOL_CAPPED in names:
-        lines.extend(vol_capped_comparison(results, names))
-    lines.extend(["", f"Each monthly start begins with $100M and runs for {horizon} calendar months. CE is the harmonic mean of terminal wealth. "
-                  "Each monthly launch counts once. Schedule sensitivity spans nonempty calendar offsets with disjoint "
-                  "holding periods within each offset. This range measures timing sensitivity, not statistical confidence."])
-    lines.extend(episode_report(results, episodes))
     Path("runs").mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder = Path(mkdtemp(prefix=stamp + "-", dir="runs"))
-    with (folder / "annual_results.csv").open("w", newline="", encoding="utf-8") as out:
-        writer = csv.DictWriter(out, fieldnames=[f.name for f in fields(AnnualResult)])
-        writer.writeheader()
-        writer.writerows(asdict(row) for row in results)
-    if selections:
-        with (folder / "selection_history.csv").open("w", newline="", encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=selections[0])
-            writer.writeheader()
-            writer.writerows(selections)
-        from cushion_report import comparison_report
-        if HYBRID in names and results:
-            lines.extend(comparison_report(folder, results, names, FLOOR))
-    if smooth_selections:
-        with (folder / "smooth_selection_history.csv").open("w", newline="", encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=smooth_selections[0])
-            writer.writeheader()
-            writer.writerows(smooth_selections)
-        if TIME_AWARE in names:
-            lines.extend(smooth_comparison(results, names, smooth_selections))
-    if launch_settings:
-        with (folder / "smooth_launch_settings.csv").open("w", newline="", encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=launch_settings[0])
-            writer.writeheader()
-            writer.writerows(launch_settings)
-    write_figures(folder, results, names, CONDITIONS, FLOOR, BREACH_LIMIT, horizon, reference_paths,
-                  expanded_grid=VOL_CAPPED in names)
-    if not reference_paths:
-        lines.extend(["", "Allocation heatmaps have no reference launch because no monthly start was eligible."])
-    lines.extend(["", "![Terminal wealth distribution](terminal_wealth_distribution.png)",
-                  "", "![Stock allocation by volatility](stock_allocation_by_volatility.png)",
-                  "", "![Stock allocation by time remaining](stock_allocation_by_time.png)",
-                  "", "![Starting volatility and terminal wealth](starting_volatility_vs_wealth.png)"])
-    (folder / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(table), end="\n\n")
+    included = sorted({r.start_month for r in results})
+    write_csv(folder / "run_metadata.csv", [dict(
+        command=shlex.join(["python3", Path(__file__).name, *(sys.argv[1:] if argv is None else argv)]),
+        data_path=args.data, data_sha256=hashlib.sha256(data).hexdigest(), start_year=start, end_year=end,
+        horizon_months=horizon, vol_lookback=args.vol_lookback, eligible_starts=len(included),
+        first_start=min(included, default=None), last_start=max(included, default=None))])
+    write_csv(folder / "excluded_starts.csv", [dict(start_month=m, reason=why) for m, why in excluded.items()])
+    write_csv(folder / "annual_results.csv", (asdict(row) for row in results), [f.name for f in fields(AnnualResult)])
+    summary = []
+    for name in names:
+        rows = [r for r in results if r.strategy == name]
+        summary.append(summary_row(name, "all", rows, horizon))
+        for condition in CONDITIONS:
+            summary.append(summary_row(name, condition, [r for r in rows if r.condition == condition], horizon))
+    write_csv(folder / "summary.csv", summary)
+    write_csv(folder / "crisis_sensitivity.csv", episode_report(results, episodes))
+    write_csv(folder / "selection_history.csv", selections)
+    write_csv(folder / "smooth_selection_history.csv", smooth_selections)
+    write_csv(folder / "smooth_launch_settings.csv", launch_settings)
+    if HYBRID in names and results:
+        comparison_report(folder, results, names, FLOOR)
+    if TIME_AWARE in names and results:
+        write_csv(folder / "smooth_comparison.csv", smooth_comparison(results, names))
+        modes = {r["selection_date"].year: r["mode"] for r in smooth_selections}
+        counts = dict.fromkeys(("nominal warm-up", "calibrated", "cash fallback"), 0)
+        for row in results:
+            if row.strategy == TIME_AWARE:
+                counts[modes[row.year]] += 1
+        write_csv(folder / "smooth_mode_counts.csv", [dict(mode=mode, starts=n) for mode, n in counts.items()])
+    if VOL_CAPPED in names:
+        write_csv(folder / "vol_capped_comparison.csv", vol_capped_comparison(results, names))
+    write_terminal_wealth_ecdf(folder, results, names, CONDITIONS, FLOOR, BREACH_LIMIT, horizon)
+    write_allocation_heatmaps(folder, names, reference_paths, FLOOR, expanded_grid=VOL_CAPPED in names)
     print(folder)
 
 

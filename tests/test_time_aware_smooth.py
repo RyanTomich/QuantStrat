@@ -3,7 +3,7 @@ from dataclasses import replace
 from datetime import date
 from unittest.mock import patch
 
-from backtest import AnnualResult, BREACH_LIMIT, CONDITIONS, Session, run_years
+from plot_backtest import AnnualResult, BREACH_LIMIT, CONDITIONS, Session, run_years
 from cushion_selection import SMOOTH_SCALES, TIME_AWARE, select_smooth_scale
 from trader import FLOOR, SmoothCushionTrader, TimeAwareSmoothCushionTrader, TradingState
 
@@ -74,7 +74,7 @@ class SmoothSelectionTests(unittest.TestCase):
 
         audit = []
         names = [TIME_AWARE, "fixed-time-aware-smooth-cushion"]
-        with patch("backtest.select_smooth_scale", side_effect=choices):
+        with patch("plot_backtest.select_smooth_scale", side_effect=choices):
             rows, _ = run_years(sessions, names, 2001, 2002, smooth_selection_history=audit)
             changed = [replace(s, equity_return=-.40) if s.date == date(2001, 8, 1) else s
                        for s in sessions]

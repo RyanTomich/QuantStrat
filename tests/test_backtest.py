@@ -5,7 +5,7 @@ from math import sqrt
 from statistics import stdev
 from unittest.mock import patch
 
-from backtest import (
+from plot_backtest import (
     CONDITIONS, INITIAL, STRATEGIES, Session, annual_volatility_signals, read_sessions,
     closing_drawdowns, crisis_episodes, episode_report, is_crisis, replay, run_years,
     schedule_sensitivity, summary_row,
@@ -51,8 +51,8 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(original[1][0], changed[1][0])  # February opening trade
         self.assertEqual(original[0][31][:2], original[1][0][:2])
         self.assertEqual(changed[0][32][:2], changed[1][1][:2])
-        for offset in (0, 1):
-            past = [s.equity_return for s in revised[shock + offset - 63:shock + offset]]
+        for offset in (0, 1, 30, 31):
+            past = [s.equity_return for s in revised[shock + offset - 30:shock + offset]]
             self.assertAlmostEqual(changed[1][offset][0], stdev(past) * sqrt(252))
         self.assertGreater(changed[1][1][0], original[1][1][0])
 
@@ -81,6 +81,8 @@ class BacktestTests(unittest.TestCase):
         rows, _ = run_years(days, ["fixed-split"], 2020, 2020, horizon_months=1)
         self.assertEqual(rows[2].condition, "higher-volatility")
         self.assertEqual(rows[2].starting_drawdown, 0)
+        # The February shock still counts in April's 63-session launch condition.
+        self.assertEqual(rows[3].condition, "higher-volatility")
 
     def test_disjoint_offsets_with_missing_month_and_sparse_states(self):
         for horizon in (12, 24):
@@ -93,12 +95,15 @@ class BacktestTests(unittest.TestCase):
                 opening = date(2020 + month // 12, month % 12 + 1, 1)
                 rows.append(replace(template, first_session=opening,
                                     floor_breach=month <= shock < month + horizon))
-            low, high, represented = schedule_sensitivity(rows, horizon)
-            self.assertEqual(low, "0/1 (0.00%, offset 2)")
-            self.assertEqual(high, "1/2 (50.00%, offset 0)")
-            self.assertEqual(represented, f"{horizon}/{horizon}")
+            stats = schedule_sensitivity(rows, horizon)
+            for label, expected in (("lowest", (2, 0, 1, 0.0)), ("highest", (0, 1, 2, 0.5))):
+                self.assertEqual(tuple(stats[f"{label}_schedule_{key}"] for key in ("offset", "breaches", "starts", "rate")), expected)
+            self.assertEqual(stats["schedules_represented"], horizon)
             self.assertEqual(sum(r.floor_breach for r in rows), horizon - 1)
-            self.assertEqual(schedule_sensitivity([], horizon), ("—", "—", f"0/{horizon}"))
+            empty = schedule_sensitivity([], horizon)
+            self.assertEqual(empty["schedules_represented"], 0)
+            self.assertIsNone(empty["lowest_schedule_rate"])
+            self.assertIsNone(empty["highest_schedule_offset"])
 
     def test_episode_exclusion_includes_survivors_and_both_endpoints(self):
         day = date(2020, 1, 2)
@@ -106,10 +111,14 @@ class BacktestTests(unittest.TestCase):
         rows = [replace(sample, last_session=day + timedelta(days=4), floor_breach=True),
                 replace(sample, first_session=day - timedelta(days=3)),
                 replace(sample, first_session=day + timedelta(days=1), last_session=day + timedelta(days=4))]
-        lines = episode_report(rows, [(day, day), (day + timedelta(days=4), day + timedelta(days=4))])
+        records = episode_report(rows, [(day, day), (day + timedelta(days=4), day + timedelta(days=4))])
         for end in [day, day + timedelta(days=4)]:
-            self.assertIn(f"| {end} to {end} | test | all | 1/2 | 0/1 | -33.33 |", lines)
-            self.assertIn(f"| {end} to {end} | test | crisis | 0/0 | 0/0 | — |", lines)
+            groups = {r["condition"]: r for r in records if r["first_close"] == r["last_close"] == end and r["strategy"] == "test"}
+            metrics = ("exposed_breaches", "exposed_starts", "remaining_breaches", "remaining_starts")
+            self.assertEqual(tuple(groups["all"][k] for k in metrics), (1, 2, 0, 1))
+            self.assertAlmostEqual(groups["all"]["change_percentage_points"], -100 / 3)
+            self.assertEqual(tuple(groups["crisis"][k] for k in metrics), (0, 0, 0, 0))
+            self.assertIsNone(groups["crisis"]["change_percentage_points"])
 
     def test_input(self):
         header = b"source note\n\n,Mkt-RF,RF\n"
@@ -145,10 +154,14 @@ class BacktestTests(unittest.TestCase):
         self.assertTrue(loss.floor_breach)
         rows = [loss, floor, floor]
         expected_ce = 3 / (1 / 50_000_000 + 2 / 95_000_000)
-        line = summary_row("test", "all", rows)
-        self.assertIn(f"${expected_ce:,.2f}", line)
-        self.assertIn("1 (33.33%) | yes", line)
-        self.assertIn("| 0 | —", summary_row("test", CONDITIONS[1], []))
+        summary = summary_row("test", "all", rows)
+        self.assertAlmostEqual(summary["ce_wealth"], expected_ce)
+        self.assertEqual(summary["floor_breaches"], 1)
+        self.assertEqual(summary["breach_rate"], 1 / 3)
+        self.assertTrue(summary["above_breach_limit"])
+        empty = summary_row("test", CONDITIONS[1], [])
+        self.assertEqual(empty["starts"], 0)
+        self.assertIsNone(empty["ce_wealth"])
 
     def test_invalid_order(self):
         class BadTrader:

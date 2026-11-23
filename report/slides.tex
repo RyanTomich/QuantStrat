@@ -1,0 +1,63 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\setbeamertemplate{navigation symbols}{}
+
+\title{Presentation Title}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{frame}[plain]
+  \titlepage
+\end{frame}
+
+\begin{frame}{Objective and Constraints}
+\end{frame}
+
+\begin{frame}{Full DP}
+    \input{figures/main-figure.tex}
+\end{frame}
+
+\begin{frame}{ Volatility-Capped Smooth Cushion }
+\end{frame}
+
+\begin{frame}{Equity Allocation: Smooth Cushion Adjusts Exposure Gradually}
+    \centering
+    % Align headings with the plot panels, leaving room for the axes and colorbar.
+    \makebox[\linewidth][l]{\large\bfseries\usebeamercolor[fg]{structure}%
+        \hspace*{0.035\linewidth}%
+        \makebox[0.288\linewidth]{Regular DP}%
+        \makebox[0.288\linewidth]{Full DP}%
+        \makebox[0.288\linewidth]{Smooth}}\par
+    \smallskip
+    \includegraphics[width=\linewidth]{figures/slide-heatmaps.pdf}
+
+    \smallskip
+    {\footnotesize Dashed lines mark the \$95M floor and the launch volatility cutoff.\par}
+\end{frame}
+
+\begin{frame}{Certainty-Equivalent Wealth: Full DP Leads Overall}
+    \begin{columns}[c,onlytextwidth]
+        \begin{column}{0.58\textwidth}
+            \centering
+            \includegraphics[width=\linewidth]{figures/alternatives-cdf.pdf}
+            \par\smallskip
+            {\small\(\displaystyle
+                \mathrm{CE}=\left(\frac{1}{n}\sum_{i=1}^{n}\frac{1}{W_{T,i}}\right)^{-1}
+            \)\par}
+        \end{column}
+        \begin{column}{0.40\textwidth}
+            \centering\footnotesize
+            \setlength{\tabcolsep}{3pt}
+            \renewcommand{\arraystretch}{0.90}
+            \input{figures/slide-performance.tex}
+        \end{column}
+    \end{columns}
+    \medskip
+    {\footnotesize Monthly launches from January 1950 through October 2025 each ran for \(T=12\) months.\\
+    \(W_{T,i}\) is terminal wealth for launch \(i\). A breach occurs if \(W_{T,i}<\$95\text{M}\).\par}
+\end{frame}
+
+\end{document}

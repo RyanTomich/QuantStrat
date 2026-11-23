@@ -4,8 +4,8 @@ from datetime import date
 from statistics import stdev
 from unittest.mock import patch
 
-from allocation_heatmaps import ReferencePath
-from backtest import FIXED_SMOOTH, VOL_CAPPED, Session, launch_trader, replay, run_years
+from plot_allocation_heatmaps import ReferencePath
+from plot_backtest import FIXED_SMOOTH, VOL_CAPPED, Session, launch_trader, replay, run_years
 from cushion_selection import TIME_AWARE
 from trader import FLOOR, TradingState, VolCappedSmoothCushionTrader, funding_floor
 
@@ -76,7 +76,7 @@ class VolCappedSmoothTests(unittest.TestCase):
             return {2000: (None, [{"mode": "nominal warm-up"}]),
                     2001: (1.25, [{"mode": "calibrated"}]),
                     2002: (0., [{"mode": "cash fallback"}])}[cutoff.year]
-        with patch("backtest.select_smooth_scale", side_effect=choices):
+        with patch("plot_backtest.select_smooth_scale", side_effect=choices):
             settings = []
             rows, _ = run_years(sessions, [TIME_AWARE, VOL_CAPPED], 2000, 2002, smooth_launch_settings=settings)
             alone, _ = run_years(sessions, [VOL_CAPPED], 2000, 2002)
@@ -85,14 +85,14 @@ class VolCappedSmoothTests(unittest.TestCase):
             self.assertEqual(dict(incumbent, strategy=VOL_CAPPED), capped)
         warmup = launch_trader(VOL_CAPPED, None, None)
         self.assertEqual((warmup.annual_funding_rate, warmup.risk_scale), (0., 1.))
-        # The synthetic 63-session sample alternates signs at constant magnitude.
-        vol = stdev([s.equity_return for s in sessions[:63]]) * 252**.5
+        # The synthetic 30-session sample alternates signs at constant magnitude.
+        vol = stdev([s.equity_return for s in sessions[:30]]) * 252**.5
         for row, scale in zip(alone[::12], (None, 1.25, 0.)):
             days = [s for s in sessions if row.first_session <= s.date <= row.last_session]
             check = replay(VOL_CAPPED, launch_trader(VOL_CAPPED, None, scale), days,
                            vol, vol, [(vol, vol)] * len(days))
             self.assertAlmostEqual(row.terminal_wealth, check.terminal_wealth, places=6)
-        with patch("backtest.select_smooth_scale", side_effect=AssertionError("unexpected selection")):
+        with patch("plot_backtest.select_smooth_scale", side_effect=AssertionError("unexpected selection")):
             fixed_settings = []
             fixed, _ = run_years(sessions, [VOL_CAPPED, FIXED_SMOOTH], 2000, 2000,
                                  vol_capped_scale_source="fixed-1", smooth_launch_settings=fixed_settings)
