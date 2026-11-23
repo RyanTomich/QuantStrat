@@ -3,8 +3,8 @@
 \usetikzlibrary{arrows.meta}
 \setbeamertemplate{navigation symbols}{}
 
-\title{Presentation Title}
-\author{}
+\title{Equity Allocation Under a Terminal Wealth Floor}
+\author{Yuru Lin, Ryan Tomich, Moritz Wassermann}
 \date{}
 
 \begin{document}
@@ -14,13 +14,56 @@
 \end{frame}
 
 \begin{frame}{Objective and Constraints}
+    Start with \$100M in cash. The horizon \(T\) is set at launch (1--2 years).
+
+    \medskip
+    \begin{itemize}
+        \setlength{\itemsep}{0.8em}
+        \item \textbf{Objective.} Maximize certainty-equivalent terminal wealth
+            (\(\gamma=2\)). For each launch condition \(s\), report
+            \(\mathrm{CE}_s=1/\mathbb{E}[1/W_T\mid s]\).
+        \item \textbf{Floor.} Require \(\Pr(W_T<\$95\mathrm{M}\mid s)\le 2\%\)
+            in each launch condition.
+        \item \textbf{Trading.} Rebalance daily between diversified equity and
+            interest-bearing cash. Equity weight \(0\)--\(100\%\). Negligible costs.
+        \item \textbf{Launch condition \(s\).} Classify using data through the prior close.
+            \begin{itemize}
+                \item \textbf{Crisis:} equity index at least 20\% below its trailing 12-month high.
+                \item \textbf{High volatility:} outside crisis, 63-session equity return volatility
+                    above its historical median.
+                \item \textbf{Normal volatility:} outside crisis, volatility at or below that median.
+            \end{itemize}
+    \end{itemize}
 \end{frame}
 
 \begin{frame}{Full DP}
     \input{figures/main-figure.tex}
 \end{frame}
 
-\begin{frame}{ Volatility-Capped Smooth Cushion }
+\begin{frame}{Volatility-Capped Smooth Cushion}
+    Full DP can jump at a volatility cutoff. A smooth rule adjusts equity gradually.
+
+    \medskip
+    \begin{enumerate}
+        \item \textbf{Fund the floor.} With \(n\) days left at daily cash rate \(r_f\),
+        \[
+            \text{Reserve } R=\frac{\$95\text{M}}{(1+r_f)^n},
+            \qquad \text{cushion } C=\max(W-R,0).
+        \]
+
+        \item \textbf{Size equity.} Each extra cushion dollar adds \$1 to \$4 of base
+        equity as \(C\) grows. Scale down for higher volatility and divide by wealth
+        \(W\) to get target weight \(q\).
+
+        \medskip
+        \item \textbf{Cap smoothly.} At annualized volatility \(\sigma\),
+        \[
+            \text{Ceiling } h=\frac{1}{1+(\sigma/0.30)^4},
+            \qquad \text{equity weight } w=\frac{q}{(1+(q/h)^4)^{1/4}}.
+        \]
+        For \(q\ll h\), \(w\approx q\). For \(q\gg h\), \(w\approx h\).
+        At 30\% volatility, \(h=50\%\).
+    \end{enumerate}
 \end{frame}
 
 \begin{frame}{Equity Allocation: Smooth Cushion Adjusts Exposure Gradually}

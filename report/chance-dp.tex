@@ -148,8 +148,29 @@ For each family, Table~\ref{tab:alternatives} reports the highest overall CE amo
 
 \FloatBarrier
 \section{Discussion}
-\subsection{Expected Performance}
 \subsection{Proof it satisfies the constraints}
+We show that a portfolio starting at $\$100$ million has less than a $2\%$ chance of finishing below $\$95$ million under the Full DP stock model, for horizons from one to two years. Fix the trading policy selected at launch and divide wealth into $\$1{,}000$ intervals. For each interval, we compute an upper bound on the chance of finishing below the floor. We write this bound as $B_n(I,z)$. Its three inputs are the number of trading sessions remaining $n$, the current wealth interval $I$, and the current volatility regime $z$ (ordinary or high). For example, a ten-session bound of $1\%$ means that every starting balance in that interval has at most a $1\%$ chance of finishing below the floor if the market starts in that regime.
+
+At maturity, zero sessions remain. Set the terminal bound $B_0(I,z)$ to zero if every balance in $I$ is at least $\$95$ million. Otherwise, set it to one. This gives a valid upper bound even when the interval straddles the floor.
+
+Suppose the bounds hold with $n-1$ sessions remaining. At each balance in $I$, Full DP chooses how much to hold in equity. The market then determines the equity return (up, down, or a rare loss) and tomorrow's regime (ordinary or high). The six columns below give the probabilities of these joint outcomes, conditional on today's regime.
+\begin{center}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+& \multicolumn{2}{c}{Up move} & \multicolumn{2}{c}{Down move} & \multicolumn{2}{c}{Rare loss} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Today's regime & Ordinary & High & Ordinary & High & Ordinary & High \\
+\midrule
+Ordinary & 49.4505\% & 0.4995\% & 49.4505\% & 0.4995\% & 0.099\% & 0.001\% \\
+High     & 1.992\% & 47.808\% & 1.992\% & 47.808\% & 0.016\% & 0.384\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+For example, if today's regime is high, a rare loss followed by another high regime has probability $0.004\times0.96=0.00384$. On this branch, tomorrow's balance equals today's balance times $(1+r_f)$ minus $20\%$ of the dollars held in equity. Across starting balances in $I$, we bound the range of possible balances tomorrow and take the largest $n-1$ session bound among the intervals it intersects, using the high regime. This branch contributes $0.00384$ times that maximum. Repeating the calculation for each column and summing the six contributions gives $B_n(I,z)$ by the law of total probability. Each branch maximum covers every balance reachable on that branch, so the sum is an upper bound by induction.
+
+Full DP uses interpolated breach probabilities to select a policy. We applied the bound to each selected policy, rounding probabilities upward and assigning a breach probability of one to any branch that leaves the verification range. Starting from $\$100$ million, we checked all five cushion multipliers and every horizon from 224 through 566 sessions, covering all 12- to 24-month windows in the historical calendar. The largest bounds, rounded upward, were $1.698\%$ for ordinary starts and $1.644\%$ for high-volatility starts. The all-cash fallback has zero breach probability at the modeled positive cash rate. Under the model, any group defined from launch history, including crisis launches, averages conditional risks that are each below $2\%$.
+
 \subsection{When to use the strategy}
 
 \appendix
